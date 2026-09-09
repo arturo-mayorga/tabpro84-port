@@ -262,6 +262,170 @@
  	VERB("status=%08x", status);
  
  	mdp_dispatch_irqs(mdp_kms, status);
+--- a/drivers/gpu/drm/msm/disp/mdp5/mdp5_encoder.c
++++ b/drivers/gpu/drm/msm/disp/mdp5/mdp5_encoder.c
+@@ -5,11 +5,58 @@
+  * Author: Rob Clark <robdclark@gmail.com>
+  */
+ 
++#include <linux/moduleparam.h>
++
+ #include <drm/drm_crtc.h>
+ #include <drm/drm_probe_helper.h>
+ 
+ #include "mdp5_kms.h"
+ 
++/*
++ * Bonded ("split") DSI for the Tab Pro 8.4.
++ *
++ * This panel is one 1600x2560 surface fed by two DSI links carrying 800
++ * columns each. msm_dsi already handles its half: given the full-width mode it
++ * halves the horizontal timing per host (dsi_host.c, is_bonded_dsi), and it
++ * deliberately creates no encoder or connector for the slave link
++ * (dsi.c: "Just skip creating encoder/connector for the slave-DSI"). Nothing
++ * in MDP5 picks up the slack, so INTF2's timing generator is never started and
++ * only the left half of the panel is ever driven.
++ *
++ * Downstream MDSS drives this with the split-display block, which mainline
++ * declares in mdp5.xml.h but never writes. For video mode with INTF1 as the
++ * master it is exactly (mdss_mdp_ctl.c, mdss_mdp_ctl_split_display_setup):
++ *
++ *	SPLIT_DPL_LOWER = INTF2_TG_SYNC	slave timing generator follows INTF1
++ *	SPLIT_DPL_UPPER = 0		(sw trigger mux is command-mode only)
++ *	SPLIT_DPL_EN    = 1
++ *
++ * What is NOT settled is whether the hardware will then feed INTF2 from the
++ * right half of a single wide layer mixer, or whether it insists on a second
++ * CTL and mixer the way downstream allocates them. That is the difference
++ * between this and a much larger change, and it is cheaper to ask the hardware
++ * than to reason about it, so this is a parameter rather than a policy:
++ *
++ *	msm.mdp5_split_dsi=1
++ *
++ * With it off the driver behaves exactly as before, so one kernel can boot
++ * both the known-good 800-wide configuration and the experiment.
++ */
++static bool mdp5_split_dsi;
++module_param(mdp5_split_dsi, bool, 0600);
++MODULE_PARM_DESC(mdp5_split_dsi,
++		 "Drive INTF2 alongside INTF1 for a bonded (dual-link) DSI panel");
++
++/* the slave interface, fixed by the SoC: DSI0 -> INTF1, DSI1 -> INTF2 */
++#define MDP5_SPLIT_SLAVE_INTF	2
++
++static bool mdp5_encoder_is_split_master(struct mdp5_encoder *mdp5_encoder)
++{
++	return mdp5_split_dsi &&
++	       mdp5_encoder->intf->type == INTF_DSI &&
++	       mdp5_encoder->intf->num == 1;
++}
++
+ static struct mdp5_kms *get_kms(struct drm_encoder *encoder)
+ {
+ 	struct msm_drm_private *priv = encoder->dev->dev_private;
+@@ -28,6 +75,7 @@
+ 	uint32_t dtv_hsync_skew, vsync_period, vsync_len, ctrl_pol;
+ 	uint32_t display_v_start, display_v_end;
+ 	uint32_t hsync_start_x, hsync_end_x;
++	struct drm_display_mode split_mode;
+ 	uint32_t format = 0x2100;
+ 	unsigned long flags;
+ 
+@@ -70,6 +118,23 @@
+ 		}
+ 	}
+ 
++	/*
++	 * In bonded DSI the DRM mode carries the whole panel, but each INTF
++	 * only clocks out its own half, so the horizontal numbers have to be
++	 * halved here. dpu_encoder_phys_vid.c does the same thing with a bare
++	 * "mode.hdisplay >>= 1"; the vertical timing is shared and untouched.
++	 */
++	if (mdp5_encoder_is_split_master(mdp5_encoder)) {
++		mode = &split_mode;
++		drm_mode_copy(mode, adjusted_mode);
++		mode->hdisplay    /= 2;
++		mode->hsync_start /= 2;
++		mode->hsync_end   /= 2;
++		mode->htotal      /= 2;
++		mode->clock       /= 2;
++		DBG("bonded DSI: per-link mode " DRM_MODE_FMT, DRM_MODE_ARG(mode));
++	}
++
+ 	hsync_start_x = (mode->htotal - mode->hsync_start);
+ 	hsync_end_x = mode->htotal - (mode->hsync_start - mode->hdisplay) - 1;
+ 
+@@ -112,6 +177,37 @@
+ 	mdp5_write(mdp5_kms, REG_MDP5_INTF_PANEL_FORMAT(intf), format);
+ 	mdp5_write(mdp5_kms, REG_MDP5_INTF_FRAME_LINE_COUNT_EN(intf), 0x3);  /* frame+line? */
+ 
++	/*
++	 * The slave INTF scans the other half of the same panel, so it takes
++	 * an identical timing programme. Its timing generator is started in
++	 * mdp5_vid_encoder_enable() and slaved to INTF1 via SPLIT_DPL_LOWER.
++	 */
++	if (mdp5_encoder_is_split_master(mdp5_encoder)) {
++		int sintf = MDP5_SPLIT_SLAVE_INTF;
++
++		mdp5_write(mdp5_kms, REG_MDP5_INTF_HSYNC_CTL(sintf),
++			MDP5_INTF_HSYNC_CTL_PULSEW(mode->hsync_end - mode->hsync_start) |
++			MDP5_INTF_HSYNC_CTL_PERIOD(mode->htotal));
++		mdp5_write(mdp5_kms, REG_MDP5_INTF_VSYNC_PERIOD_F0(sintf), vsync_period);
++		mdp5_write(mdp5_kms, REG_MDP5_INTF_VSYNC_LEN_F0(sintf), vsync_len);
++		mdp5_write(mdp5_kms, REG_MDP5_INTF_DISPLAY_HCTL(sintf),
++			MDP5_INTF_DISPLAY_HCTL_START(hsync_start_x) |
++			MDP5_INTF_DISPLAY_HCTL_END(hsync_end_x));
++		mdp5_write(mdp5_kms, REG_MDP5_INTF_DISPLAY_VSTART_F0(sintf), display_v_start);
++		mdp5_write(mdp5_kms, REG_MDP5_INTF_DISPLAY_VEND_F0(sintf), display_v_end);
++		mdp5_write(mdp5_kms, REG_MDP5_INTF_BORDER_COLOR(sintf), 0);
++		mdp5_write(mdp5_kms, REG_MDP5_INTF_UNDERFLOW_COLOR(sintf), 0xff);
++		mdp5_write(mdp5_kms, REG_MDP5_INTF_HSYNC_SKEW(sintf), dtv_hsync_skew);
++		mdp5_write(mdp5_kms, REG_MDP5_INTF_POLARITY_CTL(sintf), ctrl_pol);
++		mdp5_write(mdp5_kms, REG_MDP5_INTF_ACTIVE_HCTL(sintf),
++			MDP5_INTF_ACTIVE_HCTL_START(0) |
++			MDP5_INTF_ACTIVE_HCTL_END(0));
++		mdp5_write(mdp5_kms, REG_MDP5_INTF_ACTIVE_VSTART_F0(sintf), 0);
++		mdp5_write(mdp5_kms, REG_MDP5_INTF_ACTIVE_VEND_F0(sintf), 0);
++		mdp5_write(mdp5_kms, REG_MDP5_INTF_PANEL_FORMAT(sintf), format);
++		mdp5_write(mdp5_kms, REG_MDP5_INTF_FRAME_LINE_COUNT_EN(sintf), 0x3);
++	}
++
+ 	spin_unlock_irqrestore(&mdp5_encoder->intf_lock, flags);
+ 
+ 	mdp5_crtc_set_pipeline(encoder->crtc);
+@@ -134,6 +230,12 @@
+ 	mdp5_ctl_set_encoder_state(ctl, pipeline, false);
+ 
+ 	spin_lock_irqsave(&mdp5_encoder->intf_lock, flags);
++	if (mdp5_encoder_is_split_master(mdp5_encoder)) {
++		mdp5_write(mdp5_kms,
++			   REG_MDP5_INTF_TIMING_ENGINE_EN(MDP5_SPLIT_SLAVE_INTF), 0);
++		mdp5_write(mdp5_kms, REG_MDP5_SPLIT_DPL_EN, 0);
++		mdp5_write(mdp5_kms, REG_MDP5_SPLIT_DPL_LOWER, 0);
++	}
+ 	mdp5_write(mdp5_kms, REG_MDP5_INTF_TIMING_ENGINE_EN(intfn), 0);
+ 	spin_unlock_irqrestore(&mdp5_encoder->intf_lock, flags);
+ 	mdp5_ctl_commit(ctl, pipeline, mdp_ctl_flush_mask_encoder(intf), true);
+@@ -165,6 +267,19 @@
+ 		return;
+ 
+ 	spin_lock_irqsave(&mdp5_encoder->intf_lock, flags);
++	/*
++	 * Order matters: arm the split block and the slave generator before
++	 * the master starts, so INTF2 has something to lock to on the very
++	 * first frame rather than free-running until the next vsync.
++	 */
++	if (mdp5_encoder_is_split_master(mdp5_encoder)) {
++		mdp5_write(mdp5_kms, REG_MDP5_SPLIT_DPL_UPPER, 0);
++		mdp5_write(mdp5_kms, REG_MDP5_SPLIT_DPL_LOWER,
++			   MDP5_SPLIT_DPL_LOWER_INTF2_TG_SYNC);
++		mdp5_write(mdp5_kms, REG_MDP5_SPLIT_DPL_EN, 1);
++		mdp5_write(mdp5_kms,
++			   REG_MDP5_INTF_TIMING_ENGINE_EN(MDP5_SPLIT_SLAVE_INTF), 1);
++	}
+ 	mdp5_write(mdp5_kms, REG_MDP5_INTF_TIMING_ENGINE_EN(intfn), 1);
+ 	spin_unlock_irqrestore(&mdp5_encoder->intf_lock, flags);
+ 	mdp5_ctl_commit(ctl, pipeline, mdp_ctl_flush_mask_encoder(intf), true);
 --- a/arch/arm/boot/dts/qcom/qcom-msm8974.dtsi
 +++ b/arch/arm/boot/dts/qcom/qcom-msm8974.dtsi
 @@ -2058,7 +2058,7 @@
@@ -974,7 +1138,7 @@
 +MODULE_LICENSE("GPL");
 --- a/arch/arm/boot/dts/qcom/qcom-msm8974-samsung-mondrianwifi.dts
 +++ b/arch/arm/boot/dts/qcom/qcom-msm8974-samsung-mondrianwifi.dts
-@@ -0,0 +1,379 @@
+@@ -0,0 +1,407 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +/*
 + * Samsung Galaxy Tab Pro 8.4 Wi-Fi (SM-T320, "mondrianwifi")
@@ -1266,6 +1430,10 @@
 +	 * mode (~320 MHz pixel / ~1.92 GHz per lane), and the PLL rejects it:
 +	 *   msm_dsi_host_power_on: failed to enable link clocks. ret=-22
 +	 */
++	qcom,dual-dsi-mode;
++	qcom,master-dsi;
++	qcom,sync-dual-dsi;
++
 +	vdd-supply   = <&pm8941_l22>;
 +	vddio-supply = <&pm8941_l12>;
 +	vdda-supply  = <&pm8941_l2>;
@@ -1296,6 +1464,13 @@
 +					remote-endpoint = <&mdss_dsi0_out>;
 +				};
 +			};
++
++			port@1 {
++				reg = <1>;
++				panel_in1: endpoint {
++					remote-endpoint = <&mdss_dsi1_out>;
++				};
++			};
 +		};
 +	};
 +};
@@ -1311,11 +1486,28 @@
 +};
 +
 +&mdss_dsi1 {
-+	status = "disabled";
++	status = "okay";
++
++	qcom,dual-dsi-mode;
++	qcom,sync-dual-dsi;
++
++	/* DSI1 is the slave link, so it runs off DSI0's PLL */
++	assigned-clock-parents = <&mdss_dsi0_phy DSI_BYTE_PLL_CLK>,
++				 <&mdss_dsi0_phy DSI_PIXEL_PLL_CLK>;
++
++	vdd-supply   = <&pm8941_l22>;
++	vddio-supply = <&pm8941_l12>;
++	vdda-supply  = <&pm8941_l2>;
++};
++
++&mdss_dsi1_out {
++	remote-endpoint = <&panel_in1>;
++	data-lanes = <0 1 2 3>;
 +};
 +
 +&mdss_dsi1_phy {
-+	status = "disabled";
++	status = "okay";
++	vddio-supply = <&pm8941_l12>;
 +};
 +
 +/*

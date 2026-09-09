@@ -2,7 +2,7 @@ maintainer="Luca Weiss <luca@lucaweiss.eu>"
 _flavor="postmarketos-qcom-msm8974"
 pkgname=linux-$_flavor
 pkgver=6.16.12
-pkgrel=22
+pkgrel=23
 pkgdesc="Mainline Kernel fork for MSM8974 devices"
 arch="armv7"
 _carch="arm"
@@ -67,5 +67,5 @@ package() {
 sha512sums="
 6e67e6c86e36e235bad086ea2984c0885eb2e47264e667aa177df8ed7c29edbb23a866407dc59bdd39cfb95f6677e755a426eff485a93898c01997a6a6fcdd9c  linux-v6.16.12-msm8974.tar.gz
 2955e959961bd5bff9fe0a286bc0cdcf3aee4bd4cbe452daaa8096aedf5de0da62fd5bee8de166edb5eedf7acd9c004696eff6d5a8713bc0ee018cc0443eff48  config-postmarketos-qcom-msm8974.armv7
-ddd4e809e9bb5f4f228879202b590c909ca5b69e20376b35ccbb572e75167d6a7edce1bf4299e8ec3e25a11aba539558210363c707461a22111a9a3bf63d0e0c  0001-add-samsung-mondrianwifi.patch
+18ecd2b8842a675352a5eafa4a1d94801e8ef1e5c0a3c5fd501cd879dcfecdaea4abd318855c0f3408af7f685367f075377deb9fe427d33a023685391670a930  0001-add-samsung-mondrianwifi.patch
 "
