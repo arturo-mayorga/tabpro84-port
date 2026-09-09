@@ -612,7 +612,7 @@
 +MODULE_LICENSE("GPL");
 --- a/arch/arm/boot/dts/qcom/qcom-msm8974-samsung-mondrianwifi.dts
 +++ b/arch/arm/boot/dts/qcom/qcom-msm8974-samsung-mondrianwifi.dts
-@@ -0,0 +1,368 @@
+@@ -0,0 +1,379 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +/*
 + * Samsung Galaxy Tab Pro 8.4 Wi-Fi (SM-T320, "mondrianwifi")
@@ -979,6 +979,17 @@
 +
 +	qcom,init-seq = /bits/ 8 <0x1 0x64>;
 +
++	status = "okay";
++};
++
++/*
++ * Adreno 330. The SoC dtsi ships gpu@fdb00000 as status = "disabled"; every
++ * board that wants acceleration enables it itself (compare
++ * qcom-msm8974pro-samsung-klte-common.dtsi). Without this, msm probes the
++ * display only and prints "no GPU device was found", and freedreno fails
++ * every MSM_GET_PARAM with -ENXIO, so no EGL/GLES context can be created.
++ */
++&gpu {
 +	status = "okay";
 +};
 --- a/Documentation/devicetree/bindings/display/panel/samsung,r63319.yaml

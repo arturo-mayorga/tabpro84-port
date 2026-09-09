@@ -2,7 +2,7 @@
 pkgname=device-samsung-mondrianwifi
 pkgdesc="Samsung Galaxy Tab Pro 8.4 (Wi-Fi)"
 pkgver=0.1
-pkgrel=2
+pkgrel=5
 url="https://postmarketos.org"
 license="MIT"
 arch="armv7"
@@ -12,6 +12,13 @@ depends="
 	mkbootimg
 	postmarketos-base
 	soc-qcom-msm8974
+"
+# Adreno 330 needs a330_pfp.fw / a330_pm4.fw for the GPU to come up at all,
+# and wcn36xx needs this unit's own WCNSS calibration, which only exists on
+# the device -- msm-firmware-loader lifts it out of the vendor partitions.
+depends="$depends
+	linux-firmware-qcom
+	msm-firmware-loader
 "
 makedepends="devicepkg-dev"
 source="deviceinfo"
@@ -25,5 +32,5 @@ package() {
 }
 
 sha512sums="
-f8a2afa03b5f0e40ec05a6d03092ea254ca9b1265fdd8fd1217b03fc0f1677926169fb6804eb2199e432bd696ad014a495bdd93ba0728d27ff3f9ed7fb4f1507  deviceinfo
+23fcf1776946d3b57d947b79594fb8b1a97dcf17e63224a9714d9b3776572586db8fb915942294e7660efce4755d50332b3f1fb34c55c4450e0a84f45effa19d  deviceinfo
 "
