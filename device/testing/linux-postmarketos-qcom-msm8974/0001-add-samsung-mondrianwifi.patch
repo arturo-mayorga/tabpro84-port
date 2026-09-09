@@ -950,7 +950,7 @@
  	uint32_t nplanes, config = 0;
  	struct phase_step step = { { 0 } };
  	struct pixel_ext pe = { { 0 } };
-@@ -900,7 +917,22 @@
+@@ -900,7 +917,23 @@
  			crtc->base.id, crtc_x, crtc_y, crtc_w, crtc_h);
  
  	right_hwpipe = to_mdp5_plane_state(pstate)->r_hwpipe;
@@ -962,7 +962,8 @@
 +		 * at the seam, so its destination x is relative to that.
 +		 */
 +		unsigned int l_crtc_w = mixer_width - crtc_x;
-+		uint32_t l_src_w = (uint64_t)src_w * l_crtc_w / crtc_w;
++		/* <= 4096 * 2048, fits u32: no 64-bit division on ARM32 */
++		uint32_t l_src_w = src_w * l_crtc_w / crtc_w;
 +
 +		r_crtc_x = 0;
 +		r_crtc_w = crtc_w - l_crtc_w;
@@ -974,7 +975,7 @@
  		/*
  		 * if the plane comprises of 2 hw pipes, assume that the width
  		 * is split equally across them. The only parameters that varies
-@@ -909,6 +941,13 @@
+@@ -909,6 +942,13 @@
  		crtc_w /= 2;
  		src_w /= 2;
  		src_img_w /= 2;
@@ -988,7 +989,7 @@
  	}
  
  	ret = calc_scalex_steps(plane, pix_format, src_w, crtc_w, step.x);
-@@ -948,9 +987,9 @@
+@@ -948,9 +988,9 @@
  	if (right_hwpipe)
  		mdp5_hwpipe_mode_set(mdp5_kms, right_hwpipe, fb, &step, &pe,
  				     config, hdecm, vdecm, hflip, vflip,
@@ -1000,7 +1001,7 @@
  
  	return ret;
  }
-@@ -995,6 +1034,31 @@
+@@ -995,6 +1035,31 @@
  	return mask;
  }
  
