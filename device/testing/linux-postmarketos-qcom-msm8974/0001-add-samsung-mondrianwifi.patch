@@ -1,14 +1,602 @@
---- a/drivers/gpu/drm/msm/dsi/dsi_cfg.c
-+++ b/drivers/gpu/drm/msm/dsi/dsi_cfg.c
-@@ -43,7 +43,7 @@
- 	.bus_clk_names = dsi_6g_bus_clk_names,
- 	.num_bus_clks = ARRAY_SIZE(dsi_6g_bus_clk_names),
- 	.io_start = {
--		{ 0xfd922800, 0xfd922b00 },
-+		{ 0xfd922800, 0xfd922e00 },
- 	},
- };
+--- a/Documentation/devicetree/bindings/arm/qcom.yaml
++++ b/Documentation/devicetree/bindings/arm/qcom.yaml
+@@ -141,6 +141,7 @@
+       - items:
+           - enum:
+               - qcom,apq8074-dragonboard
++              - samsung,mondrianwifi
+           - const: qcom,apq8074
  
+       - items:
+--- a/arch/arm/boot/dts/qcom/Makefile
++++ b/arch/arm/boot/dts/qcom/Makefile
+@@ -46,6 +46,7 @@
+ 	qcom-msm8974-lge-nexus5-hammerhead.dtb \
+ 	qcom-msm8974-samsung-hlte.dtb \
+ 	qcom-msm8974-samsung-lt03lte.dtb \
++	qcom-msm8974-samsung-mondrianwifi.dtb \
+ 	qcom-msm8974-sony-xperia-rhine-amami.dtb \
+ 	qcom-msm8974-sony-xperia-rhine-honami.dtb \
+ 	qcom-msm8974-sony-xperia-rhine-togari.dtb \
+--- a/arch/arm/boot/dts/qcom/qcom-msm8974.dtsi
++++ b/arch/arm/boot/dts/qcom/qcom-msm8974.dtsi
+@@ -2058,7 +2058,7 @@
+ 				reg-names = "dsi_ctrl";
+ 
+ 				interrupt-parent = <&mdss>;
+-				interrupts = <4>;
++				interrupts = <5>;
+ 
+ 				assigned-clocks = <&mmcc BYTE1_CLK_SRC>,
+ 						  <&mmcc PCLK1_CLK_SRC>;
+--- a/drivers/gpu/drm/msm/disp/mdp5/mdp5_cfg.c
++++ b/drivers/gpu/drm/msm/disp/mdp5/mdp5_cfg.c
+@@ -64,7 +64,8 @@
+ 		.base = { 0x03100, 0x03500, 0x03900, 0x03d00, 0x04100 },
+ 		.instances = {
+ 				{ .id = 0, .pp = 0, .dspp = 0,
+-				  .caps = MDP_LM_CAP_DISPLAY, },
++				  .caps = MDP_LM_CAP_DISPLAY |
++					  MDP_LM_CAP_PAIR, },
+ 				{ .id = 1, .pp = 1, .dspp = 1,
+ 				  .caps = MDP_LM_CAP_DISPLAY, },
+ 				{ .id = 2, .pp = 2, .dspp = 2,
+@@ -228,7 +229,8 @@
+ 		.base = { 0x03100, 0x03500, 0x03900, 0x03d00, 0x04100 },
+ 		.instances = {
+ 				{ .id = 0, .pp = 0, .dspp = 0,
+-				  .caps = MDP_LM_CAP_DISPLAY, },
++				  .caps = MDP_LM_CAP_DISPLAY |
++					  MDP_LM_CAP_PAIR, },
+ 				{ .id = 1, .pp = 1, .dspp = 1,
+ 				  .caps = MDP_LM_CAP_DISPLAY, },
+ 				{ .id = 2, .pp = 2, .dspp = 2,
+--- a/drivers/gpu/drm/msm/disp/mdp5/mdp5_crtc.c
++++ b/drivers/gpu/drm/msm/disp/mdp5/mdp5_crtc.c
+@@ -88,18 +88,29 @@
+ 	reinit_completion(&mdp5_crtc->pp_completion);
+ }
+ 
+-static u32 crtc_flush(struct drm_crtc *crtc, u32 flush_mask)
++static u32 crtc_flush(struct drm_crtc *crtc, u32 flush_mask, u32 r_flush_mask)
+ {
+ 	struct mdp5_crtc_state *mdp5_cstate = to_mdp5_crtc_state(crtc->state);
+ 	struct mdp5_ctl *ctl = mdp5_cstate->ctl;
+ 	struct mdp5_pipeline *pipeline = &mdp5_cstate->pipeline;
+ 	bool start = !mdp5_cstate->defer_start;
++	u32 flushed;
+ 
+ 	mdp5_cstate->defer_start = false;
+ 
+-	DBG("%s: flush=%08x", crtc->name, flush_mask);
++	DBG("%s: flush=%08x r_flush=%08x", crtc->name, flush_mask, r_flush_mask);
+ 
+-	return mdp5_ctl_commit(ctl, pipeline, flush_mask, start);
++	flushed = mdp5_ctl_commit(ctl, pipeline, flush_mask, start);
++
++	/* split display: the right mixer's blocks are flushed via its CTL */
++	if (pipeline->r_ctl) {
++		struct mdp5_pipeline rp;
++
++		mdp5_pipeline_right(pipeline, &rp);
++		mdp5_ctl_commit(pipeline->r_ctl, &rp, r_flush_mask, start);
++	}
++
++	return flushed;
+ }
+ 
+ /*
+@@ -112,7 +123,8 @@
+ 	struct mdp5_crtc_state *mdp5_cstate = to_mdp5_crtc_state(crtc->state);
+ 	struct mdp5_hw_mixer *mixer, *r_mixer;
+ 	struct drm_plane *plane;
+-	uint32_t flush_mask = 0;
++	uint32_t flush_mask = 0, r_flush_mask = 0;
++	u32 mixer_width = mdp5_crtc_state_split_width(crtc->state);
+ 
+ 	/* this should not happen: */
+ 	if (WARN_ON(!mdp5_cstate->ctl))
+@@ -121,17 +133,27 @@
+ 	drm_atomic_crtc_for_each_plane(plane, crtc) {
+ 		if (!plane->state->visible)
+ 			continue;
+-		flush_mask |= mdp5_plane_get_flush(plane);
++		if (mixer_width) {
++			u32 l, r;
++
++			mdp5_plane_get_flush_split(plane, mixer_width, &l, &r);
++			flush_mask |= l;
++			r_flush_mask |= r;
++		} else {
++			flush_mask |= mdp5_plane_get_flush(plane);
++		}
+ 	}
+ 
+ 	mixer = mdp5_cstate->pipeline.mixer;
+ 	flush_mask |= mdp_ctl_flush_mask_lm(mixer->lm);
+ 
+ 	r_mixer = mdp5_cstate->pipeline.r_mixer;
+-	if (r_mixer)
++	if (r_mixer && mixer_width)
++		r_flush_mask |= mdp_ctl_flush_mask_lm(r_mixer->lm);
++	else if (r_mixer)
+ 		flush_mask |= mdp_ctl_flush_mask_lm(r_mixer->lm);
+ 
+-	return crtc_flush(crtc, flush_mask);
++	return crtc_flush(crtc, flush_mask, r_flush_mask);
+ }
+ 
+ /* if file!=NULL, this is preclose potential cancel-flip path */
+@@ -222,6 +244,7 @@
+ 	struct mdp5_hw_mixer *r_mixer = pipeline->r_mixer;
+ 	uint32_t r_lm = r_mixer ? r_mixer->lm : 0;
+ 	struct mdp5_ctl *ctl = mdp5_cstate->ctl;
++	u32 mixer_width = mdp5_crtc_state_split_width(crtc->state);
+ 	uint32_t blend_op, fg_alpha, bg_alpha, ctl_blend_flags = 0;
+ 	unsigned long flags;
+ 	enum mdp5_pipe stage[STAGE_MAX + 1][MAX_PIPE_STAGE] = { { SSPP_NONE } };
+@@ -248,23 +271,43 @@
+ 
+ 		pstate = to_mdp5_plane_state(plane->state);
+ 		pstates[pstate->stage] = pstate;
+-		stage[pstate->stage][PIPE_LEFT] = mdp5_plane_pipe(plane);
+-		/*
+-		 * if we have a right mixer, stage the same pipe as we
+-		 * have on the left mixer
+-		 */
+-		if (r_mixer)
+-			r_stage[pstate->stage][PIPE_LEFT] =
+-						mdp5_plane_pipe(plane);
+-		/*
+-		 * if we have a right pipe (i.e, the plane comprises of 2
+-		 * hwpipes, then stage the right pipe on the right side of both
+-		 * the layer mixers
+-		 */
+ 		right_pipe = mdp5_plane_right_pipe(plane);
+-		if (right_pipe) {
+-			stage[pstate->stage][PIPE_RIGHT] = right_pipe;
+-			r_stage[pstate->stage][PIPE_RIGHT] = right_pipe;
++
++		if (mixer_width) {
++			/*
++			 * Split display: no source split on this hardware,
++			 * so each mixer only sees the hwpipe that covers its
++			 * own half. A plane across the seam has one per side;
++			 * one wholly right of the seam is staged on the right
++			 * mixer alone.
++			 */
++			int x = plane->state->crtc_x;
++			int w = plane->state->crtc_w;
++
++			if (x < (int)mixer_width)
++				stage[pstate->stage][PIPE_LEFT] =
++						mdp5_plane_pipe(plane);
++			if (x + w > (int)mixer_width)
++				r_stage[pstate->stage][PIPE_LEFT] = right_pipe ?
++						right_pipe : mdp5_plane_pipe(plane);
++		} else {
++			stage[pstate->stage][PIPE_LEFT] = mdp5_plane_pipe(plane);
++			/*
++			 * if we have a right mixer, stage the same pipe as we
++			 * have on the left mixer
++			 */
++			if (r_mixer)
++				r_stage[pstate->stage][PIPE_LEFT] =
++							mdp5_plane_pipe(plane);
++			/*
++			 * if we have a right pipe (i.e, the plane comprises of 2
++			 * hwpipes, then stage the right pipe on the right side of both
++			 * the layer mixers
++			 */
++			if (right_pipe) {
++				stage[pstate->stage][PIPE_RIGHT] = right_pipe;
++				r_stage[pstate->stage][PIPE_RIGHT] = right_pipe;
++			}
+ 		}
+ 
+ 		plane_cnt++;
+@@ -400,7 +443,10 @@
+ 
+ 		/* Assign mixer to RIGHT side in source split mode */
+ 		val = mdp5_read(mdp5_kms, REG_MDP5_LM_BLEND_COLOR_OUT(r_lm));
+-		val |= MDP5_LM_BLEND_COLOR_OUT_SPLIT_LEFT_RIGHT;
++		if (mdp5_pipeline_is_split(&mdp5_cstate->pipeline))
++			val &= ~MDP5_LM_BLEND_COLOR_OUT_SPLIT_LEFT_RIGHT;
++		else
++			val |= MDP5_LM_BLEND_COLOR_OUT_SPLIT_LEFT_RIGHT;
+ 		mdp5_write(mdp5_kms, REG_MDP5_LM_BLEND_COLOR_OUT(r_lm), val);
+ 	}
+ 
+@@ -631,6 +677,8 @@
+ 	intf = pipeline->intf;
+ 
+ 	mdp5_cstate->err_irqmask = intf2err(intf->num);
++	if (pipeline->r_intf)
++		mdp5_cstate->err_irqmask |= intf2err(pipeline->r_intf->num);
+ 	mdp5_cstate->vblank_irqmask = intf2vblank(pipeline->mixer, intf);
+ 
+ 	if ((intf->type == INTF_DSI) &&
+@@ -749,6 +797,10 @@
+ 	if (mode->hdisplay > hw_cfg->lm.max_width)
+ 		need_right_mixer = true;
+ 
++	/* split display: one mixer per INTF, whatever the width */
++	if (mdp5_pipeline_is_split(&mdp5_cstate->pipeline))
++		need_right_mixer = true;
++
+ 	ret = mdp5_crtc_setup_pipeline(crtc, crtc_state, need_right_mixer);
+ 	if (ret) {
+ 		DRM_DEV_ERROR(dev->dev, "couldn't assign mixers %d\n", ret);
+@@ -1021,7 +1073,7 @@
+ 		goto end;
+ 	}
+ 
+-	crtc_flush(crtc, flush_mask);
++	crtc_flush(crtc, flush_mask, 0);
+ 
+ end:
+ 	pm_runtime_put_sync(&pdev->dev);
+@@ -1070,7 +1122,7 @@
+ 	mdp5_crtc_restore_cursor(crtc);
+ 	spin_unlock_irqrestore(&mdp5_crtc->cursor.lock, flags);
+ 
+-	crtc_flush(crtc, flush_mask);
++	crtc_flush(crtc, flush_mask, 0);
+ 
+ 	pm_runtime_put_sync(&mdp5_kms->pdev->dev);
+ 
+@@ -1271,6 +1323,13 @@
+ 	mdp_irq_update(&mdp5_kms->base);
+ 
+ 	mdp5_ctl_set_pipeline(mdp5_cstate->ctl, &mdp5_cstate->pipeline);
++
++	if (mdp5_cstate->pipeline.r_ctl) {
++		struct mdp5_pipeline rp;
++
++		mdp5_pipeline_right(&mdp5_cstate->pipeline, &rp);
++		mdp5_ctl_set_pipeline(mdp5_cstate->pipeline.r_ctl, &rp);
++	}
+ }
+ 
+ struct mdp5_ctl *mdp5_crtc_get_ctl(struct drm_crtc *crtc)
+--- a/drivers/gpu/drm/msm/disp/mdp5/mdp5_ctl.c
++++ b/drivers/gpu/drm/msm/disp/mdp5/mdp5_ctl.c
+@@ -157,7 +157,11 @@
+ 		break;
+ 	}
+ 
+-	if (pipeline->r_mixer)
++	/*
++	 * Two mixers into one INTF is the 3D-pack case; in split display the
++	 * right mixer has an INTF of its own and nothing must be packed.
++	 */
++	if (pipeline->r_mixer && !mdp5_pipeline_is_split(pipeline))
+ 		ctl_op |= MDP5_CTL_OP_PACK_3D_ENABLE |
+ 			  MDP5_CTL_OP_PACK_3D(1);
+ 
+@@ -354,12 +358,16 @@
+ {
+ 	struct mdp5_hw_mixer *mixer = pipeline->mixer;
+ 	struct mdp5_hw_mixer *r_mixer = pipeline->r_mixer;
++	/* in split display the right mixer's LAYER regs live in its own CTL */
++	struct mdp5_ctl *r_ctl = pipeline->r_ctl ? pipeline->r_ctl : ctl;
+ 	unsigned long flags;
+ 	u32 blend_cfg = 0, blend_ext_cfg = 0;
+ 	u32 r_blend_cfg = 0, r_blend_ext_cfg = 0;
+ 	int i, start_stage;
+ 
+ 	mdp5_ctl_reset_blend_regs(ctl);
++	if (r_ctl != ctl)
++		mdp5_ctl_reset_blend_regs(r_ctl);
+ 
+ 	if (ctl_blend_op_flags & MDP5_CTL_BLEND_OP_FLAG_BORDER_OUT) {
+ 		start_stage = STAGE0;
+@@ -394,7 +402,7 @@
+ 	ctl_write(ctl, REG_MDP5_CTL_LAYER_REG(ctl->id, mixer->lm), blend_cfg);
+ 	ctl_write(ctl, REG_MDP5_CTL_LAYER_EXT_REG(ctl->id, mixer->lm),
+ 		  blend_ext_cfg);
+-	if (r_mixer) {
++	if (r_mixer && r_ctl == ctl) {
+ 		ctl_write(ctl, REG_MDP5_CTL_LAYER_REG(ctl->id, r_mixer->lm),
+ 			  r_blend_cfg);
+ 		ctl_write(ctl, REG_MDP5_CTL_LAYER_EXT_REG(ctl->id, r_mixer->lm),
+@@ -402,9 +410,24 @@
+ 	}
+ 	spin_unlock_irqrestore(&ctl->hw_lock, flags);
+ 
++	if (r_mixer && r_ctl != ctl) {
++		spin_lock_irqsave(&r_ctl->hw_lock, flags);
++		ctl_write(r_ctl, REG_MDP5_CTL_LAYER_REG(r_ctl->id, r_mixer->lm),
++			  r_blend_cfg);
++		ctl_write(r_ctl, REG_MDP5_CTL_LAYER_EXT_REG(r_ctl->id, r_mixer->lm),
++			  r_blend_ext_cfg);
++		spin_unlock_irqrestore(&r_ctl->hw_lock, flags);
++	}
++
+ 	ctl->pending_ctl_trigger = mdp_ctl_flush_mask_lm(mixer->lm);
+-	if (r_mixer)
+-		ctl->pending_ctl_trigger |= mdp_ctl_flush_mask_lm(r_mixer->lm);
++	if (r_mixer) {
++		if (r_ctl != ctl)
++			r_ctl->pending_ctl_trigger =
++				mdp_ctl_flush_mask_lm(r_mixer->lm);
++		else
++			ctl->pending_ctl_trigger |=
++				mdp_ctl_flush_mask_lm(r_mixer->lm);
++	}
+ 
+ 	DBG("lm%d: blend config = 0x%08x. ext_cfg = 0x%08x", mixer->lm,
+ 		blend_cfg, blend_ext_cfg);
+--- a/drivers/gpu/drm/msm/disp/mdp5/mdp5_encoder.c
++++ b/drivers/gpu/drm/msm/disp/mdp5/mdp5_encoder.c
+@@ -5,17 +5,110 @@
+  * Author: Rob Clark <robdclark@gmail.com>
+  */
+ 
++#include <linux/moduleparam.h>
++
+ #include <drm/drm_crtc.h>
+ #include <drm/drm_probe_helper.h>
+ 
+ #include "mdp5_kms.h"
+ 
++/*
++ * Split display for bonded DSI on MDP5 v1.x (msm8974).
++ *
++ * The Tab Pro 8.4 panel is one 1600x2560 surface fed by two DSI links of 800
++ * columns each. msm_dsi already handles its half: given the full-width mode it
++ * halves the horizontal timing per host (dsi_host.c, is_bonded_dsi) and
++ * creates no encoder or connector for the slave link. Nothing in MDP5 picked
++ * up the slack, so INTF2 never ran and only the left half was ever driven.
++ *
++ * Mainline's bonded-DSI support in mdp5_ctl.c is the "single flush" scheme,
++ * which the driver gates on hardware rev 3+; on v1.x it is dead code. This
++ * hardware instead does what the downstream MDSS driver calls a split
++ * display (mdss_mdp_ctl.c, mdss_mdp_ctl_split_display_setup): two layer
++ * mixers, each with its own CTL and INTF, tied together by the split-display
++ * block so that INTF2's timing generator follows INTF1's:
++ *
++ *	SPLIT_DPL_LOWER = INTF2_TG_SYNC
++ *	SPLIT_DPL_UPPER = 0		(sw-trigger mux is command-mode only)
++ *	SPLIT_DPL_EN    = 1
++ *
++ * Only INTF1's timing engine is ever started; INTF2 is slaved to it.
++ *
++ * The master encoder borrows the slave encoder's INTF and CTL and records
++ * them in the CRTC pipeline (r_intf / r_ctl); the CRTC, planes and CTL code
++ * then route the right mixer through them. All of it sits behind
++ *
++ *	msm.mdp5_split_dsi=1
++ *
++ * so one kernel boots both the known-good single-link configuration and this.
++ */
++static bool mdp5_split_dsi;
++module_param(mdp5_split_dsi, bool, 0600);
++MODULE_PARM_DESC(mdp5_split_dsi,
++		 "Drive INTF2 alongside INTF1 for a bonded (dual-link) DSI panel");
++
++/* fixed by the SoC: DSI0 -> INTF1 (master), DSI1 -> INTF2 (slave) */
++#define MDP5_SPLIT_MASTER_INTF	1
++#define MDP5_SPLIT_SLAVE_INTF	2
++
+ static struct mdp5_kms *get_kms(struct drm_encoder *encoder)
+ {
+ 	struct msm_drm_private *priv = encoder->dev->dev_private;
+ 	return to_mdp5_kms(to_mdp_kms(priv->kms));
+ }
+ 
++static bool mdp5_encoder_is_split_master(struct mdp5_encoder *mdp5_encoder)
++{
++	return mdp5_split_dsi &&
++	       mdp5_encoder->intf->type == INTF_DSI &&
++	       mdp5_encoder->intf->num == MDP5_SPLIT_MASTER_INTF;
++}
++
++static struct mdp5_encoder *mdp5_encoder_find_intf(struct drm_device *dev,
++						   int intf_num)
++{
++	struct drm_encoder *encoder;
++
++	drm_for_each_encoder(encoder, dev) {
++		struct mdp5_encoder *e = to_mdp5_encoder(encoder);
++
++		if (e->intf && e->intf->num == intf_num)
++			return e;
++	}
++	return NULL;
++}
++
++static void mdp5_vid_intf_program(struct mdp5_kms *mdp5_kms, int intf,
++				  struct drm_display_mode *mode,
++				  uint32_t hsync_start_x, uint32_t hsync_end_x,
++				  uint32_t vsync_period, uint32_t vsync_len,
++				  uint32_t display_v_start, uint32_t display_v_end,
++				  uint32_t dtv_hsync_skew, uint32_t ctrl_pol,
++				  uint32_t format)
++{
++	mdp5_write(mdp5_kms, REG_MDP5_INTF_HSYNC_CTL(intf),
++			MDP5_INTF_HSYNC_CTL_PULSEW(mode->hsync_end - mode->hsync_start) |
++			MDP5_INTF_HSYNC_CTL_PERIOD(mode->htotal));
++	mdp5_write(mdp5_kms, REG_MDP5_INTF_VSYNC_PERIOD_F0(intf), vsync_period);
++	mdp5_write(mdp5_kms, REG_MDP5_INTF_VSYNC_LEN_F0(intf), vsync_len);
++	mdp5_write(mdp5_kms, REG_MDP5_INTF_DISPLAY_HCTL(intf),
++			MDP5_INTF_DISPLAY_HCTL_START(hsync_start_x) |
++			MDP5_INTF_DISPLAY_HCTL_END(hsync_end_x));
++	mdp5_write(mdp5_kms, REG_MDP5_INTF_DISPLAY_VSTART_F0(intf), display_v_start);
++	mdp5_write(mdp5_kms, REG_MDP5_INTF_DISPLAY_VEND_F0(intf), display_v_end);
++	mdp5_write(mdp5_kms, REG_MDP5_INTF_BORDER_COLOR(intf), 0);
++	mdp5_write(mdp5_kms, REG_MDP5_INTF_UNDERFLOW_COLOR(intf), 0xff);
++	mdp5_write(mdp5_kms, REG_MDP5_INTF_HSYNC_SKEW(intf), dtv_hsync_skew);
++	mdp5_write(mdp5_kms, REG_MDP5_INTF_POLARITY_CTL(intf), ctrl_pol);
++	mdp5_write(mdp5_kms, REG_MDP5_INTF_ACTIVE_HCTL(intf),
++			MDP5_INTF_ACTIVE_HCTL_START(0) |
++			MDP5_INTF_ACTIVE_HCTL_END(0));
++	mdp5_write(mdp5_kms, REG_MDP5_INTF_ACTIVE_VSTART_F0(intf), 0);
++	mdp5_write(mdp5_kms, REG_MDP5_INTF_ACTIVE_VEND_F0(intf), 0);
++	mdp5_write(mdp5_kms, REG_MDP5_INTF_PANEL_FORMAT(intf), format);
++	mdp5_write(mdp5_kms, REG_MDP5_INTF_FRAME_LINE_COUNT_EN(intf), 0x3);  /* frame+line? */
++}
++
+ static void mdp5_vid_encoder_mode_set(struct drm_encoder *encoder,
+ 				      struct drm_display_mode *mode,
+ 				      struct drm_display_mode *adjusted_mode)
+@@ -24,15 +117,34 @@
+ 	struct mdp5_kms *mdp5_kms = get_kms(encoder);
+ 	struct drm_device *dev = encoder->dev;
+ 	struct drm_connector *connector;
++	struct mdp5_pipeline *pipeline = mdp5_crtc_get_pipeline(encoder->crtc);
+ 	int intf = mdp5_encoder->intf->num;
+ 	uint32_t dtv_hsync_skew, vsync_period, vsync_len, ctrl_pol;
+ 	uint32_t display_v_start, display_v_end;
+ 	uint32_t hsync_start_x, hsync_end_x;
++	struct drm_display_mode split_mode;
+ 	uint32_t format = 0x2100;
+ 	unsigned long flags;
+ 
+ 	mode = adjusted_mode;
+ 
++	/*
++	 * Split display: the DRM mode carries the whole panel, but each INTF
++	 * only clocks out its own half, so halve the horizontal numbers here
++	 * (dpu_encoder_phys_vid.c does the same with "mode.hdisplay >>= 1").
++	 * The vertical timing is shared and untouched.
++	 */
++	if (mdp5_pipeline_is_split(pipeline)) {
++		mode = &split_mode;
++		drm_mode_copy(mode, adjusted_mode);
++		mode->hdisplay    /= 2;
++		mode->hsync_start /= 2;
++		mode->hsync_end   /= 2;
++		mode->htotal      /= 2;
++		mode->clock       /= 2;
++		DBG("split display: per-INTF mode " DRM_MODE_FMT, DRM_MODE_ARG(mode));
++	}
++
+ 	DBG("set mode: " DRM_MODE_FMT, DRM_MODE_ARG(mode));
+ 
+ 	ctrl_pol = 0;
+@@ -90,27 +202,16 @@
+ 
+ 	spin_lock_irqsave(&mdp5_encoder->intf_lock, flags);
+ 
+-	mdp5_write(mdp5_kms, REG_MDP5_INTF_HSYNC_CTL(intf),
+-			MDP5_INTF_HSYNC_CTL_PULSEW(mode->hsync_end - mode->hsync_start) |
+-			MDP5_INTF_HSYNC_CTL_PERIOD(mode->htotal));
+-	mdp5_write(mdp5_kms, REG_MDP5_INTF_VSYNC_PERIOD_F0(intf), vsync_period);
+-	mdp5_write(mdp5_kms, REG_MDP5_INTF_VSYNC_LEN_F0(intf), vsync_len);
+-	mdp5_write(mdp5_kms, REG_MDP5_INTF_DISPLAY_HCTL(intf),
+-			MDP5_INTF_DISPLAY_HCTL_START(hsync_start_x) |
+-			MDP5_INTF_DISPLAY_HCTL_END(hsync_end_x));
+-	mdp5_write(mdp5_kms, REG_MDP5_INTF_DISPLAY_VSTART_F0(intf), display_v_start);
+-	mdp5_write(mdp5_kms, REG_MDP5_INTF_DISPLAY_VEND_F0(intf), display_v_end);
+-	mdp5_write(mdp5_kms, REG_MDP5_INTF_BORDER_COLOR(intf), 0);
+-	mdp5_write(mdp5_kms, REG_MDP5_INTF_UNDERFLOW_COLOR(intf), 0xff);
+-	mdp5_write(mdp5_kms, REG_MDP5_INTF_HSYNC_SKEW(intf), dtv_hsync_skew);
+-	mdp5_write(mdp5_kms, REG_MDP5_INTF_POLARITY_CTL(intf), ctrl_pol);
+-	mdp5_write(mdp5_kms, REG_MDP5_INTF_ACTIVE_HCTL(intf),
+-			MDP5_INTF_ACTIVE_HCTL_START(0) |
+-			MDP5_INTF_ACTIVE_HCTL_END(0));
+-	mdp5_write(mdp5_kms, REG_MDP5_INTF_ACTIVE_VSTART_F0(intf), 0);
+-	mdp5_write(mdp5_kms, REG_MDP5_INTF_ACTIVE_VEND_F0(intf), 0);
+-	mdp5_write(mdp5_kms, REG_MDP5_INTF_PANEL_FORMAT(intf), format);
+-	mdp5_write(mdp5_kms, REG_MDP5_INTF_FRAME_LINE_COUNT_EN(intf), 0x3);  /* frame+line? */
++	mdp5_vid_intf_program(mdp5_kms, intf, mode, hsync_start_x, hsync_end_x,
++			      vsync_period, vsync_len, display_v_start,
++			      display_v_end, dtv_hsync_skew, ctrl_pol, format);
++	/* the slave INTF scans the other half of the same panel: same programme */
++	if (mdp5_pipeline_is_split(pipeline))
++		mdp5_vid_intf_program(mdp5_kms, pipeline->r_intf->num, mode,
++				      hsync_start_x, hsync_end_x,
++				      vsync_period, vsync_len, display_v_start,
++				      display_v_end, dtv_hsync_skew, ctrl_pol,
++				      format);
+ 
+ 	spin_unlock_irqrestore(&mdp5_encoder->intf_lock, flags);
+ 
+@@ -132,11 +233,29 @@
+ 		return;
+ 
+ 	mdp5_ctl_set_encoder_state(ctl, pipeline, false);
++	if (mdp5_pipeline_is_split(pipeline)) {
++		struct mdp5_pipeline rp;
++
++		mdp5_pipeline_right(pipeline, &rp);
++		mdp5_ctl_set_encoder_state(pipeline->r_ctl, &rp, false);
++	}
+ 
+ 	spin_lock_irqsave(&mdp5_encoder->intf_lock, flags);
+ 	mdp5_write(mdp5_kms, REG_MDP5_INTF_TIMING_ENGINE_EN(intfn), 0);
++	if (mdp5_pipeline_is_split(pipeline)) {
++		mdp5_write(mdp5_kms, REG_MDP5_SPLIT_DPL_EN, 0);
++		mdp5_write(mdp5_kms, REG_MDP5_SPLIT_DPL_LOWER, 0);
++		mdp5_write(mdp5_kms, REG_MDP5_SPLIT_DPL_UPPER, 0);
++	}
+ 	spin_unlock_irqrestore(&mdp5_encoder->intf_lock, flags);
+ 	mdp5_ctl_commit(ctl, pipeline, mdp_ctl_flush_mask_encoder(intf), true);
++	if (mdp5_pipeline_is_split(pipeline)) {
++		struct mdp5_pipeline rp;
++
++		mdp5_pipeline_right(pipeline, &rp);
++		mdp5_ctl_commit(pipeline->r_ctl, &rp,
++				mdp_ctl_flush_mask_encoder(rp.intf), true);
++	}
+ 
+ 	/*
+ 	 * Wait for a vsync so we know the ENABLE=0 latched before
+@@ -165,9 +284,28 @@
+ 		return;
+ 
+ 	spin_lock_irqsave(&mdp5_encoder->intf_lock, flags);
++	/*
++	 * Split display: arm the split block before the master timing engine
++	 * starts, so INTF2 locks to INTF1 from the very first frame. INTF2's
++	 * own TIMING_ENGINE_EN is deliberately left alone, as downstream does.
++	 */
++	if (mdp5_pipeline_is_split(pipeline)) {
++		mdp5_write(mdp5_kms, REG_MDP5_SPLIT_DPL_UPPER, 0);
++		mdp5_write(mdp5_kms, REG_MDP5_SPLIT_DPL_LOWER,
++			   MDP5_SPLIT_DPL_LOWER_INTF2_TG_SYNC);
++		mdp5_write(mdp5_kms, REG_MDP5_SPLIT_DPL_EN, 1);
++	}
+ 	mdp5_write(mdp5_kms, REG_MDP5_INTF_TIMING_ENGINE_EN(intfn), 1);
+ 	spin_unlock_irqrestore(&mdp5_encoder->intf_lock, flags);
+ 	mdp5_ctl_commit(ctl, pipeline, mdp_ctl_flush_mask_encoder(intf), true);
++	if (mdp5_pipeline_is_split(pipeline)) {
++		struct mdp5_pipeline rp;
++
++		mdp5_pipeline_right(pipeline, &rp);
++		mdp5_ctl_commit(pipeline->r_ctl, &rp,
++				mdp_ctl_flush_mask_encoder(rp.intf), true);
++		mdp5_ctl_set_encoder_state(pipeline->r_ctl, &rp, true);
++	}
+ 
+ 	mdp5_ctl_set_encoder_state(ctl, pipeline, true);
+ 
+@@ -224,6 +362,24 @@
+ 
+ 	mdp5_cstate->ctl = ctl;
+ 	mdp5_cstate->pipeline.intf = intf;
++	mdp5_cstate->pipeline.r_intf = NULL;
++	mdp5_cstate->pipeline.r_ctl = NULL;
++
++	if (mdp5_encoder_is_split_master(mdp5_encoder)) {
++		struct mdp5_encoder *slave =
++			mdp5_encoder_find_intf(encoder->dev, MDP5_SPLIT_SLAVE_INTF);
++
++		if (!slave || !slave->ctl) {
++			DRM_DEV_ERROR(encoder->dev->dev,
++				      "split display: no INTF%d encoder/CTL\n",
++				      MDP5_SPLIT_SLAVE_INTF);
++			return -EINVAL;
++		}
++		mdp5_cstate->pipeline.r_intf = slave->intf;
++		mdp5_cstate->pipeline.r_ctl = slave->ctl;
++		DBG("split display: INTF%d master, INTF%d slave", intf->num,
++		    slave->intf->num);
++	}
+ 
+ 	/*
+ 	 * This is a bit awkward, but we want to flush the CTL and hit the
 --- a/drivers/gpu/drm/msm/disp/mdp5/mdp5_irq.c
 +++ b/drivers/gpu/drm/msm/disp/mdp5/mdp5_irq.c
 @@ -4,7 +4,10 @@
@@ -262,191 +850,199 @@
  	VERB("status=%08x", status);
  
  	mdp_dispatch_irqs(mdp_kms, status);
---- a/drivers/gpu/drm/msm/disp/mdp5/mdp5_encoder.c
-+++ b/drivers/gpu/drm/msm/disp/mdp5/mdp5_encoder.c
-@@ -5,11 +5,58 @@
-  * Author: Rob Clark <robdclark@gmail.com>
-  */
- 
-+#include <linux/moduleparam.h>
+--- a/drivers/gpu/drm/msm/disp/mdp5/mdp5_kms.h
++++ b/drivers/gpu/drm/msm/disp/mdp5/mdp5_kms.h
+@@ -112,8 +112,32 @@
+ 	struct mdp5_interface *intf;
+ 	struct mdp5_hw_mixer *mixer;
+ 	struct mdp5_hw_mixer *r_mixer;	/* right mixer */
 +
- #include <drm/drm_crtc.h>
- #include <drm/drm_probe_helper.h>
++	/*
++	 * Split display (MDP5 v1.x, e.g. msm8974): a bonded-DSI panel whose
++	 * halves hang off two interfaces. The right mixer then feeds its own
++	 * CTL and INTF instead of being packed into the left INTF's stream.
++	 * r_intf != NULL is what marks a pipeline as split.
++	 */
++	struct mdp5_interface *r_intf;
++	struct mdp5_ctl *r_ctl;
+ };
  
- #include "mdp5_kms.h"
- 
-+/*
-+ * Bonded ("split") DSI for the Tab Pro 8.4.
-+ *
-+ * This panel is one 1600x2560 surface fed by two DSI links carrying 800
-+ * columns each. msm_dsi already handles its half: given the full-width mode it
-+ * halves the horizontal timing per host (dsi_host.c, is_bonded_dsi), and it
-+ * deliberately creates no encoder or connector for the slave link
-+ * (dsi.c: "Just skip creating encoder/connector for the slave-DSI"). Nothing
-+ * in MDP5 picks up the slack, so INTF2's timing generator is never started and
-+ * only the left half of the panel is ever driven.
-+ *
-+ * Downstream MDSS drives this with the split-display block, which mainline
-+ * declares in mdp5.xml.h but never writes. For video mode with INTF1 as the
-+ * master it is exactly (mdss_mdp_ctl.c, mdss_mdp_ctl_split_display_setup):
-+ *
-+ *	SPLIT_DPL_LOWER = INTF2_TG_SYNC	slave timing generator follows INTF1
-+ *	SPLIT_DPL_UPPER = 0		(sw trigger mux is command-mode only)
-+ *	SPLIT_DPL_EN    = 1
-+ *
-+ * What is NOT settled is whether the hardware will then feed INTF2 from the
-+ * right half of a single wide layer mixer, or whether it insists on a second
-+ * CTL and mixer the way downstream allocates them. That is the difference
-+ * between this and a much larger change, and it is cheaper to ask the hardware
-+ * than to reason about it, so this is a parameter rather than a policy:
-+ *
-+ *	msm.mdp5_split_dsi=1
-+ *
-+ * With it off the driver behaves exactly as before, so one kernel can boot
-+ * both the known-good 800-wide configuration and the experiment.
-+ */
-+static bool mdp5_split_dsi;
-+module_param(mdp5_split_dsi, bool, 0600);
-+MODULE_PARM_DESC(mdp5_split_dsi,
-+		 "Drive INTF2 alongside INTF1 for a bonded (dual-link) DSI panel");
-+
-+/* the slave interface, fixed by the SoC: DSI0 -> INTF1, DSI1 -> INTF2 */
-+#define MDP5_SPLIT_SLAVE_INTF	2
-+
-+static bool mdp5_encoder_is_split_master(struct mdp5_encoder *mdp5_encoder)
++static inline bool mdp5_pipeline_is_split(const struct mdp5_pipeline *p)
 +{
-+	return mdp5_split_dsi &&
-+	       mdp5_encoder->intf->type == INTF_DSI &&
-+	       mdp5_encoder->intf->num == 1;
++	return p->r_intf != NULL;
 +}
 +
- static struct mdp5_kms *get_kms(struct drm_encoder *encoder)
- {
- 	struct msm_drm_private *priv = encoder->dev->dev_private;
-@@ -28,6 +75,7 @@
- 	uint32_t dtv_hsync_skew, vsync_period, vsync_len, ctrl_pol;
- 	uint32_t display_v_start, display_v_end;
- 	uint32_t hsync_start_x, hsync_end_x;
-+	struct drm_display_mode split_mode;
- 	uint32_t format = 0x2100;
- 	unsigned long flags;
++/* the right half of a split pipeline, as seen by its own CTL */
++static inline void mdp5_pipeline_right(const struct mdp5_pipeline *p,
++				       struct mdp5_pipeline *rp)
++{
++	*rp = (struct mdp5_pipeline) {
++		.intf = p->r_intf,
++		.mixer = p->r_mixer,
++	};
++}
++
+ struct mdp5_crtc_state {
+ 	struct drm_crtc_state base;
  
-@@ -70,6 +118,23 @@
- 		}
+@@ -138,6 +162,22 @@
+ #define to_mdp5_crtc_state(x) \
+ 		container_of(x, struct mdp5_crtc_state, base)
+ 
++/*
++ * Width of one layer mixer when the CRTC is in split-display mode, 0 when
++ * it is not. Planes use this to decide which mixer(s) they land on.
++ */
++static inline u32 mdp5_crtc_state_split_width(const struct drm_crtc_state *cs)
++{
++	const struct mdp5_crtc_state *mdp5_cstate;
++
++	if (!cs)
++		return 0;
++	mdp5_cstate = to_mdp5_crtc_state(cs);
++	if (!mdp5_pipeline_is_split(&mdp5_cstate->pipeline))
++		return 0;
++	return cs->adjusted_mode.hdisplay / 2;
++}
++
+ enum mdp5_intf_mode {
+ 	MDP5_INTF_MODE_NONE = 0,
+ 
+@@ -272,6 +312,8 @@
+ void mdp5_irq_domain_fini(struct mdp5_kms *mdp5_kms);
+ 
+ uint32_t mdp5_plane_get_flush(struct drm_plane *plane);
++void mdp5_plane_get_flush_split(struct drm_plane *plane, u32 mixer_width,
++				u32 *left, u32 *right);
+ enum mdp5_pipe mdp5_plane_pipe(struct drm_plane *plane);
+ enum mdp5_pipe mdp5_plane_right_pipe(struct drm_plane *plane);
+ struct drm_plane *mdp5_plane_init(struct drm_device *dev,
+--- a/drivers/gpu/drm/msm/disp/mdp5/mdp5_plane.c
++++ b/drivers/gpu/drm/msm/disp/mdp5/mdp5_plane.c
+@@ -216,6 +216,19 @@
+ 	if (ret)
+ 		return ret;
+ 
++	/*
++	 * Split display: the CRTC is two side-by-side mixers, each on its own
++	 * INTF, and this hardware has no source split, so a plane straddling
++	 * the seam needs one hwpipe per mixer.
++	 */
++	if (plane_enabled(state)) {
++		u32 mixer_width = mdp5_crtc_state_split_width(crtc_state);
++
++		if (mixer_width && state->crtc_x < (int)mixer_width &&
++		    state->crtc_x + (int)state->crtc_w > (int)mixer_width)
++			need_right_hwpipe = true;
++	}
++
+ 	if (plane_enabled(state)) {
+ 		unsigned int rotation;
+ 		const struct msm_format *format;
+@@ -853,6 +866,10 @@
+ 	enum mdp5_pipe pipe = hwpipe->pipe;
+ 	struct mdp5_hw_pipe *right_hwpipe;
+ 	const struct msm_format *format;
++	u32 mixer_width = mdp5_crtc_state_split_width(crtc->state);
++	int r_crtc_x = 0;
++	unsigned int r_crtc_w = 0;
++	uint32_t r_src_x = 0, r_src_w = 0;
+ 	uint32_t nplanes, config = 0;
+ 	struct phase_step step = { { 0 } };
+ 	struct pixel_ext pe = { { 0 } };
+@@ -900,7 +917,22 @@
+ 			crtc->base.id, crtc_x, crtc_y, crtc_w, crtc_h);
+ 
+ 	right_hwpipe = to_mdp5_plane_state(pstate)->r_hwpipe;
+-	if (right_hwpipe) {
++	if (right_hwpipe && mixer_width) {
++		/*
++		 * Split display: cut the plane at the mixer seam. The right
++		 * hwpipe is staged on the right mixer, whose coordinates start
++		 * at the seam, so its destination x is relative to that.
++		 */
++		unsigned int l_crtc_w = mixer_width - crtc_x;
++		uint32_t l_src_w = (uint64_t)src_w * l_crtc_w / crtc_w;
++
++		r_crtc_x = 0;
++		r_crtc_w = crtc_w - l_crtc_w;
++		r_src_x = src_x + l_src_w;
++		r_src_w = src_w - l_src_w;
++		crtc_w = l_crtc_w;
++		src_w = l_src_w;
++	} else if (right_hwpipe) {
+ 		/*
+ 		 * if the plane comprises of 2 hw pipes, assume that the width
+ 		 * is split equally across them. The only parameters that varies
+@@ -909,6 +941,13 @@
+ 		crtc_w /= 2;
+ 		src_w /= 2;
+ 		src_img_w /= 2;
++		r_crtc_x = crtc_x + crtc_w;
++		r_crtc_w = crtc_w;
++		r_src_x = src_x + src_w;
++		r_src_w = src_w;
++	} else if (mixer_width && crtc_x >= (int)mixer_width) {
++		/* entirely on the right mixer: one hwpipe, seam-relative */
++		crtc_x -= mixer_width;
  	}
  
-+	/*
-+	 * In bonded DSI the DRM mode carries the whole panel, but each INTF
-+	 * only clocks out its own half, so the horizontal numbers have to be
-+	 * halved here. dpu_encoder_phys_vid.c does the same thing with a bare
-+	 * "mode.hdisplay >>= 1"; the vertical timing is shared and untouched.
-+	 */
-+	if (mdp5_encoder_is_split_master(mdp5_encoder)) {
-+		mode = &split_mode;
-+		drm_mode_copy(mode, adjusted_mode);
-+		mode->hdisplay    /= 2;
-+		mode->hsync_start /= 2;
-+		mode->hsync_end   /= 2;
-+		mode->htotal      /= 2;
-+		mode->clock       /= 2;
-+		DBG("bonded DSI: per-link mode " DRM_MODE_FMT, DRM_MODE_ARG(mode));
-+	}
+ 	ret = calc_scalex_steps(plane, pix_format, src_w, crtc_w, step.x);
+@@ -948,9 +987,9 @@
+ 	if (right_hwpipe)
+ 		mdp5_hwpipe_mode_set(mdp5_kms, right_hwpipe, fb, &step, &pe,
+ 				     config, hdecm, vdecm, hflip, vflip,
+-				     crtc_x + crtc_w, crtc_y, crtc_w, crtc_h,
++				     r_crtc_x, crtc_y, r_crtc_w, crtc_h,
+ 				     src_img_w, src_img_h,
+-				     src_x + src_w, src_y, src_w, src_h);
++				     r_src_x, src_y, r_src_w, src_h);
+ 
+ 	return ret;
+ }
+@@ -995,6 +1034,31 @@
+ 	return mask;
+ }
+ 
++/*
++ * Split display: which CTL has to flush this plane's hwpipe(s). A plane
++ * across the seam has one on each side; one wholly on the right belongs
++ * to the right CTL alone.
++ */
++void mdp5_plane_get_flush_split(struct drm_plane *plane, u32 mixer_width,
++				u32 *left, u32 *right)
++{
++	struct mdp5_plane_state *pstate = to_mdp5_plane_state(plane->state);
 +
- 	hsync_start_x = (mode->htotal - mode->hsync_start);
- 	hsync_end_x = mode->htotal - (mode->hsync_start - mode->hdisplay) - 1;
- 
-@@ -112,6 +177,37 @@
- 	mdp5_write(mdp5_kms, REG_MDP5_INTF_PANEL_FORMAT(intf), format);
- 	mdp5_write(mdp5_kms, REG_MDP5_INTF_FRAME_LINE_COUNT_EN(intf), 0x3);  /* frame+line? */
- 
-+	/*
-+	 * The slave INTF scans the other half of the same panel, so it takes
-+	 * an identical timing programme. Its timing generator is started in
-+	 * mdp5_vid_encoder_enable() and slaved to INTF1 via SPLIT_DPL_LOWER.
-+	 */
-+	if (mdp5_encoder_is_split_master(mdp5_encoder)) {
-+		int sintf = MDP5_SPLIT_SLAVE_INTF;
++	*left = *right = 0;
 +
-+		mdp5_write(mdp5_kms, REG_MDP5_INTF_HSYNC_CTL(sintf),
-+			MDP5_INTF_HSYNC_CTL_PULSEW(mode->hsync_end - mode->hsync_start) |
-+			MDP5_INTF_HSYNC_CTL_PERIOD(mode->htotal));
-+		mdp5_write(mdp5_kms, REG_MDP5_INTF_VSYNC_PERIOD_F0(sintf), vsync_period);
-+		mdp5_write(mdp5_kms, REG_MDP5_INTF_VSYNC_LEN_F0(sintf), vsync_len);
-+		mdp5_write(mdp5_kms, REG_MDP5_INTF_DISPLAY_HCTL(sintf),
-+			MDP5_INTF_DISPLAY_HCTL_START(hsync_start_x) |
-+			MDP5_INTF_DISPLAY_HCTL_END(hsync_end_x));
-+		mdp5_write(mdp5_kms, REG_MDP5_INTF_DISPLAY_VSTART_F0(sintf), display_v_start);
-+		mdp5_write(mdp5_kms, REG_MDP5_INTF_DISPLAY_VEND_F0(sintf), display_v_end);
-+		mdp5_write(mdp5_kms, REG_MDP5_INTF_BORDER_COLOR(sintf), 0);
-+		mdp5_write(mdp5_kms, REG_MDP5_INTF_UNDERFLOW_COLOR(sintf), 0xff);
-+		mdp5_write(mdp5_kms, REG_MDP5_INTF_HSYNC_SKEW(sintf), dtv_hsync_skew);
-+		mdp5_write(mdp5_kms, REG_MDP5_INTF_POLARITY_CTL(sintf), ctrl_pol);
-+		mdp5_write(mdp5_kms, REG_MDP5_INTF_ACTIVE_HCTL(sintf),
-+			MDP5_INTF_ACTIVE_HCTL_START(0) |
-+			MDP5_INTF_ACTIVE_HCTL_END(0));
-+		mdp5_write(mdp5_kms, REG_MDP5_INTF_ACTIVE_VSTART_F0(sintf), 0);
-+		mdp5_write(mdp5_kms, REG_MDP5_INTF_ACTIVE_VEND_F0(sintf), 0);
-+		mdp5_write(mdp5_kms, REG_MDP5_INTF_PANEL_FORMAT(sintf), format);
-+		mdp5_write(mdp5_kms, REG_MDP5_INTF_FRAME_LINE_COUNT_EN(sintf), 0x3);
-+	}
++	if (WARN_ON(!pstate->hwpipe))
++		return;
 +
- 	spin_unlock_irqrestore(&mdp5_encoder->intf_lock, flags);
- 
- 	mdp5_crtc_set_pipeline(encoder->crtc);
-@@ -134,6 +230,12 @@
- 	mdp5_ctl_set_encoder_state(ctl, pipeline, false);
- 
- 	spin_lock_irqsave(&mdp5_encoder->intf_lock, flags);
-+	if (mdp5_encoder_is_split_master(mdp5_encoder)) {
-+		mdp5_write(mdp5_kms,
-+			   REG_MDP5_INTF_TIMING_ENGINE_EN(MDP5_SPLIT_SLAVE_INTF), 0);
-+		mdp5_write(mdp5_kms, REG_MDP5_SPLIT_DPL_EN, 0);
-+		mdp5_write(mdp5_kms, REG_MDP5_SPLIT_DPL_LOWER, 0);
++	if (pstate->r_hwpipe) {
++		*left = pstate->hwpipe->flush_mask;
++		*right = pstate->r_hwpipe->flush_mask;
++	} else if (plane->state->crtc_x >= (int)mixer_width) {
++		*right = pstate->hwpipe->flush_mask;
++	} else {
++		*left = pstate->hwpipe->flush_mask;
 +	}
- 	mdp5_write(mdp5_kms, REG_MDP5_INTF_TIMING_ENGINE_EN(intfn), 0);
- 	spin_unlock_irqrestore(&mdp5_encoder->intf_lock, flags);
- 	mdp5_ctl_commit(ctl, pipeline, mdp_ctl_flush_mask_encoder(intf), true);
-@@ -165,6 +267,19 @@
- 		return;
++}
++
+ static const uint32_t mdp5_plane_formats[] = {
+ 	DRM_FORMAT_ARGB8888,
+ 	DRM_FORMAT_ABGR8888,
+--- a/drivers/gpu/drm/msm/dsi/dsi_cfg.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_cfg.c
+@@ -43,7 +43,7 @@
+ 	.bus_clk_names = dsi_6g_bus_clk_names,
+ 	.num_bus_clks = ARRAY_SIZE(dsi_6g_bus_clk_names),
+ 	.io_start = {
+-		{ 0xfd922800, 0xfd922b00 },
++		{ 0xfd922800, 0xfd922e00 },
+ 	},
+ };
  
- 	spin_lock_irqsave(&mdp5_encoder->intf_lock, flags);
-+	/*
-+	 * Order matters: arm the split block and the slave generator before
-+	 * the master starts, so INTF2 has something to lock to on the very
-+	 * first frame rather than free-running until the next vsync.
-+	 */
-+	if (mdp5_encoder_is_split_master(mdp5_encoder)) {
-+		mdp5_write(mdp5_kms, REG_MDP5_SPLIT_DPL_UPPER, 0);
-+		mdp5_write(mdp5_kms, REG_MDP5_SPLIT_DPL_LOWER,
-+			   MDP5_SPLIT_DPL_LOWER_INTF2_TG_SYNC);
-+		mdp5_write(mdp5_kms, REG_MDP5_SPLIT_DPL_EN, 1);
-+		mdp5_write(mdp5_kms,
-+			   REG_MDP5_INTF_TIMING_ENGINE_EN(MDP5_SPLIT_SLAVE_INTF), 1);
-+	}
- 	mdp5_write(mdp5_kms, REG_MDP5_INTF_TIMING_ENGINE_EN(intfn), 1);
- 	spin_unlock_irqrestore(&mdp5_encoder->intf_lock, flags);
- 	mdp5_ctl_commit(ctl, pipeline, mdp_ctl_flush_mask_encoder(intf), true);
---- a/arch/arm/boot/dts/qcom/qcom-msm8974.dtsi
-+++ b/arch/arm/boot/dts/qcom/qcom-msm8974.dtsi
-@@ -2058,7 +2058,7 @@
- 				reg-names = "dsi_ctrl";
- 
- 				interrupt-parent = <&mdss>;
--				interrupts = <4>;
-+				interrupts = <5>;
- 
- 				assigned-clocks = <&mmcc BYTE1_CLK_SRC>,
- 						  <&mmcc PCLK1_CLK_SRC>;
---- a/Documentation/devicetree/bindings/arm/qcom.yaml
-+++ b/Documentation/devicetree/bindings/arm/qcom.yaml
-@@ -141,6 +141,7 @@
-       - items:
-           - enum:
-               - qcom,apq8074-dragonboard
-+              - samsung,mondrianwifi
-           - const: qcom,apq8074
- 
-       - items:
 --- a/drivers/gpu/drm/panel/Kconfig
 +++ b/drivers/gpu/drm/panel/Kconfig
 @@ -737,6 +737,16 @@
@@ -476,19 +1072,9 @@
  obj-$(CONFIG_DRM_PANEL_SAMSUNG_S6D16D0) += panel-samsung-s6d16d0.o
  obj-$(CONFIG_DRM_PANEL_SAMSUNG_S6D27A1) += panel-samsung-s6d27a1.o
  obj-$(CONFIG_DRM_PANEL_SAMSUNG_S6D7AA0) += panel-samsung-s6d7aa0.o
---- a/arch/arm/boot/dts/qcom/Makefile
-+++ b/arch/arm/boot/dts/qcom/Makefile
-@@ -46,6 +46,7 @@
- 	qcom-msm8974-lge-nexus5-hammerhead.dtb \
- 	qcom-msm8974-samsung-hlte.dtb \
- 	qcom-msm8974-samsung-lt03lte.dtb \
-+	qcom-msm8974-samsung-mondrianwifi.dtb \
- 	qcom-msm8974-sony-xperia-rhine-amami.dtb \
- 	qcom-msm8974-sony-xperia-rhine-honami.dtb \
- 	qcom-msm8974-sony-xperia-rhine-togari.dtb \
 --- a/drivers/gpu/drm/panel/panel-samsung-r63319.c
 +++ b/drivers/gpu/drm/panel/panel-samsung-r63319.c
-@@ -0,0 +1,723 @@
+@@ -0,0 +1,724 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Samsung 1600x2560 dual-DSI video mode panel (Renesas R63319 controller)
@@ -611,20 +1197,21 @@
 + */
 +static const struct drm_display_mode r63319_mode_dual = {
 +	/*
-+	 * Downstream uses a 150-pixel front porch per link, giving htotal 2068
-+	 * and a 320.623 MHz pixel clock. mdp5_kms.c pins the MDP core clock at
-+	 * msm8x74v2_config.max_clk = 320 MHz flat (no per-mode calculation), so
-+	 * that mode is 0.2% over what the MDP can source and INTF1 underruns:
-+	 *   [drm:mdp5_irq_error_handler] *ERROR* errors: 04000000
-+	 *   (MDP5_IRQ_INTF1_UNDER_RUN)
-+	 * Trim the front porch to 140 per link -> htotal 2048, 317.522 MHz,
-+	 * which leaves ~0.8% headroom. Porch length is not panel-critical.
++	 * Exactly twice the single-link mode: msm_dsi halves every horizontal
++	 * number per host (dsi_host.c, is_bonded_dsi) and so does the MDP5
++	 * split-display path (mdp5_encoder.c), so each link sees the vendor
++	 * 800+150+20+64 = 1034 timing that is known to drive this panel.
++	 *
++	 * An earlier revision trimmed the front porch to 140 per link on the
++	 * theory that the MDP core clock (pinned at 320 MHz) could not source
++	 * 320.6 Mpix/s. That only applies when one mixer carries the whole
++	 * width; in split display each mixer runs its own 160 Mpix/s half.
 +	 */
-+	.clock		= 317522,
++	.clock		= 320622,
 +	.hdisplay	= 1600,
-+	.hsync_start	= 1880,	/* 1600 + 2*140 front porch */
-+	.hsync_end	= 1920,	/* +      2*20  pulse width */
-+	.htotal		= 2048,	/* +      2*64  back porch  */
++	.hsync_start	= 1900,	/* 1600 + 2*150 front porch */
++	.hsync_end	= 1940,	/* +      2*20  pulse width */
++	.htotal		= 2068,	/* +      2*64  back porch  */
 +	.vdisplay	= 2560,
 +	.vsync_start	= 2572,	/* 2560 + 12 front porch */
 +	.vsync_end	= 2576,	/* +       4 pulse width */
