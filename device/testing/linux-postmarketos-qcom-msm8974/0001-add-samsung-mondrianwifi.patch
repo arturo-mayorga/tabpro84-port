@@ -274,7 +274,17 @@
  		ctl_op |= MDP5_CTL_OP_PACK_3D_ENABLE |
  			  MDP5_CTL_OP_PACK_3D(1);
  
-@@ -354,12 +358,16 @@
+@@ -262,7 +266,8 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	if (pipeline->r_mixer) {
++	/* split display keeps the LM cursor on the left mixer only */
++	if (pipeline->r_mixer && !mdp5_pipeline_is_split(pipeline)) {
+ 		DRM_DEV_ERROR(ctl_mgr->dev->dev, "unsupported configuration");
+ 		return -EINVAL;
+ 	}
+@@ -354,12 +359,16 @@
  {
  	struct mdp5_hw_mixer *mixer = pipeline->mixer;
  	struct mdp5_hw_mixer *r_mixer = pipeline->r_mixer;
@@ -291,7 +301,7 @@
  
  	if (ctl_blend_op_flags & MDP5_CTL_BLEND_OP_FLAG_BORDER_OUT) {
  		start_stage = STAGE0;
-@@ -394,7 +402,7 @@
+@@ -394,7 +403,7 @@
  	ctl_write(ctl, REG_MDP5_CTL_LAYER_REG(ctl->id, mixer->lm), blend_cfg);
  	ctl_write(ctl, REG_MDP5_CTL_LAYER_EXT_REG(ctl->id, mixer->lm),
  		  blend_ext_cfg);
@@ -300,7 +310,7 @@
  		ctl_write(ctl, REG_MDP5_CTL_LAYER_REG(ctl->id, r_mixer->lm),
  			  r_blend_cfg);
  		ctl_write(ctl, REG_MDP5_CTL_LAYER_EXT_REG(ctl->id, r_mixer->lm),
-@@ -402,9 +410,24 @@
+@@ -402,9 +411,24 @@
  	}
  	spin_unlock_irqrestore(&ctl->hw_lock, flags);
  
@@ -610,7 +620,7 @@
  
  #include <drm/drm_print.h>
  #include <drm/drm_vblank.h>
-@@ -12,6 +15,210 @@
+@@ -12,6 +15,296 @@
  #include "msm_drv.h"
  #include "mdp5_kms.h"
  
@@ -675,6 +685,92 @@
 +	.set = mdp5_dump_set,
 +};
 +module_param_cb(mdp5_dump, &mdp5_dump_ops, NULL, 0200);
++
++/*
++ * Generic MDP register window, because every split-display question is "what
++ * did CTL1 / INTF2 / LM1 actually end up with?" and /dev/mem cannot reach the
++ * register file on ARM32.
++ *
++ *   echo 0x21400      > /sys/module/msm/parameters/mdp5_peek   # 16 words
++ *   echo 0x21400,64   > /sys/module/msm/parameters/mdp5_peek   # 64 words
++ *   echo 0x2f4=1      > /sys/module/msm/parameters/mdp5_poke   # write
++ *
++ * Offsets are relative to the MDP base (same space as mdp5.xml.h).
++ */
++static int mdp5_peek_set(const char *val, const struct kernel_param *kp)
++{
++	struct mdp5_kms *mdp5_kms = mdp5_dbg_kms;
++	struct device *dev;
++	unsigned int off, count = 16, i;
++	char buf[64];
++	char *p, *cnt;
++
++	if (!mdp5_kms)
++		return -ENODEV;
++	strscpy(buf, val, sizeof(buf));
++	p = strim(buf);
++	cnt = strchr(p, ',');
++	if (cnt) {
++		*cnt++ = '\0';
++		if (kstrtouint(cnt, 0, &count))
++			return -EINVAL;
++	}
++	if (kstrtouint(p, 0, &off) || off & 3 || count > 256)
++		return -EINVAL;
++
++	dev = &mdp5_kms->pdev->dev;
++	pm_runtime_get_sync(dev);
++	for (i = 0; i < count; i += 4) {
++		u32 a = off + i * 4;
++		u32 v[4] = { 0 };
++		unsigned int j;
++
++		for (j = 0; j < 4 && i + j < count; j++)
++			v[j] = mdp5_read(mdp5_kms, a + j * 4);
++		pr_info("mdp5peek: %05x: %08x %08x %08x %08x\n",
++			a, v[0], v[1], v[2], v[3]);
++	}
++	pm_runtime_put_sync(dev);
++	return 0;
++}
++
++static const struct kernel_param_ops mdp5_peek_ops = {
++	.set = mdp5_peek_set,
++};
++module_param_cb(mdp5_peek, &mdp5_peek_ops, NULL, 0200);
++
++static int mdp5_poke_set(const char *val, const struct kernel_param *kp)
++{
++	struct mdp5_kms *mdp5_kms = mdp5_dbg_kms;
++	struct device *dev;
++	unsigned int off, v;
++	char buf[64];
++	char *p, *eq;
++
++	if (!mdp5_kms)
++		return -ENODEV;
++	strscpy(buf, val, sizeof(buf));
++	p = strim(buf);
++	eq = strchr(p, '=');
++	if (!eq)
++		return -EINVAL;
++	*eq++ = '\0';
++	if (kstrtouint(p, 0, &off) || off & 3 || kstrtouint(eq, 0, &v))
++		return -EINVAL;
++
++	dev = &mdp5_kms->pdev->dev;
++	pm_runtime_get_sync(dev);
++	mdp5_write(mdp5_kms, off, v);
++	pr_info("mdp5poke: %05x <= %08x (reads back %08x)\n", off, v,
++		mdp5_read(mdp5_kms, off));
++	pm_runtime_put_sync(dev);
++	return 0;
++}
++
++static const struct kernel_param_ops mdp5_poke_ops = {
++	.set = mdp5_poke_set,
++};
++module_param_cb(mdp5_poke, &mdp5_poke_ops, NULL, 0200);
 +
 +/*
 + * Read back what the display is actually scanning out.
@@ -821,7 +917,7 @@
  void mdp5_set_irqmask(struct mdp_kms *mdp_kms, uint32_t irqmask,
  		uint32_t old_irqmask)
  {
-@@ -52,6 +259,8 @@
+@@ -52,6 +345,8 @@
  	struct device *dev = &mdp5_kms->pdev->dev;
  	struct mdp_irq *error_handler = &mdp5_kms->error_handler;
  
@@ -830,7 +926,7 @@
  	error_handler->irq = mdp5_irq_error_handler;
  	error_handler->irqmask = MDP5_IRQ_INTF0_UNDER_RUN |
  			MDP5_IRQ_INTF1_UNDER_RUN |
-@@ -81,12 +290,17 @@
+@@ -81,12 +376,17 @@
  	struct mdp5_kms *mdp5_kms = to_mdp5_kms(mdp_kms);
  	struct drm_device *dev = mdp5_kms->dev;
  	struct drm_crtc *crtc;
@@ -917,8 +1013,57 @@
  enum mdp5_pipe mdp5_plane_pipe(struct drm_plane *plane);
  enum mdp5_pipe mdp5_plane_right_pipe(struct drm_plane *plane);
  struct drm_plane *mdp5_plane_init(struct drm_device *dev,
+--- a/drivers/gpu/drm/msm/disp/mdp5/mdp5_pipe.c
++++ b/drivers/gpu/drm/msm/disp/mdp5/mdp5_pipe.c
+@@ -94,9 +94,6 @@
+ 	if (mdp5_kms->smp) {
+ 		int ret;
+ 
+-		/* We don't support SMP and 2 hwpipes/plane together */
+-		WARN_ON(r_hwpipe);
+-
+ 		DBG("%s: alloc SMP blocks", (*hwpipe)->name);
+ 		ret = mdp5_smp_assign(mdp5_kms->smp, &new_global_state->smp,
+ 				(*hwpipe)->pipe, blkcfg);
+@@ -104,6 +101,27 @@
+ 			return -ENOMEM;
+ 
+ 		(*hwpipe)->blkcfg = blkcfg;
++
++		/*
++		 * Split display on SMP hardware (msm8974): the right hwpipe
++		 * fetches its half of the plane on its own and needs its own
++		 * blocks. blkcfg was sized for the full width, so this
++		 * over-allocates by half; the pool is 22 blocks and a
++		 * full-screen ARGB plane wants 4, so that is affordable.
++		 */
++		if (r_hwpipe) {
++			DBG("%s: alloc SMP blocks", (*r_hwpipe)->name);
++			ret = mdp5_smp_assign(mdp5_kms->smp,
++					      &new_global_state->smp,
++					      (*r_hwpipe)->pipe, blkcfg);
++			if (ret) {
++				mdp5_smp_release(mdp5_kms->smp,
++						 &new_global_state->smp,
++						 (*hwpipe)->pipe);
++				return -ENOMEM;
++			}
++			(*r_hwpipe)->blkcfg = blkcfg;
++		}
+ 	}
+ 
+ 	DBG("%s: assign to plane %s for caps %x",
 --- a/drivers/gpu/drm/msm/disp/mdp5/mdp5_plane.c
 +++ b/drivers/gpu/drm/msm/disp/mdp5/mdp5_plane.c
+@@ -69,7 +69,7 @@
+ 
+ 	drm_printf(p, "\thwpipe=%s\n", pstate->hwpipe ?
+ 			pstate->hwpipe->name : "(null)");
+-	if (mdp5_kms->caps & MDP_CAP_SRC_SPLIT)
++	if (mdp5_kms->caps & MDP_CAP_SRC_SPLIT || pstate->r_hwpipe)
+ 		drm_printf(p, "\tright-hwpipe=%s\n",
+ 			   pstate->r_hwpipe ? pstate->r_hwpipe->name :
+ 					      "(null)");
 @@ -216,6 +216,19 @@
  	if (ret)
  		return ret;
