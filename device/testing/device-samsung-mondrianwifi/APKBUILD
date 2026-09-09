@@ -2,7 +2,7 @@
 pkgname=device-samsung-mondrianwifi
 pkgdesc="Samsung Galaxy Tab Pro 8.4 (Wi-Fi)"
 pkgver=0.1
-pkgrel=5
+pkgrel=6
 url="https://postmarketos.org"
 license="MIT"
 arch="armv7"
@@ -32,5 +32,5 @@ package() {
 }
 
 sha512sums="
-23fcf1776946d3b57d947b79594fb8b1a97dcf17e63224a9714d9b3776572586db8fb915942294e7660efce4755d50332b3f1fb34c55c4450e0a84f45effa19d  deviceinfo
+05b93f8471fd13dc563e15e49a9701e866432fcb270f65f2bf22d6cd15890c4918753d4b75d44246f661c0dfc61effc4d855226be343e55c345abea4e06af390  deviceinfo
 "

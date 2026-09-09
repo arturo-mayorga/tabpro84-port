@@ -44,4 +44,4 @@ deviceinfo_flash_heimdall_partition_kernel="BOOT"
 deviceinfo_flash_heimdall_partition_system="USERDATA"
 # No IOMMU on this SoC's msm node, so display and GPU share one CMA carveout.
 # The 16m default cannot hold even two 800x2560 buffers.
-deviceinfo_kernel_cmdline="msm.vram=128m msm.allow_vram_carveout=1"
+deviceinfo_kernel_cmdline="msm.vram=128m msm.allow_vram_carveout=1 consoleblank=0"
