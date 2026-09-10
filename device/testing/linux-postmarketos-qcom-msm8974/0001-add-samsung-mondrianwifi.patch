@@ -1253,6 +1253,46 @@
  obj-$(CONFIG_DRM_PANEL_SAMSUNG_S6D16D0) += panel-samsung-s6d16d0.o
  obj-$(CONFIG_DRM_PANEL_SAMSUNG_S6D27A1) += panel-samsung-s6d27a1.o
  obj-$(CONFIG_DRM_PANEL_SAMSUNG_S6D7AA0) += panel-samsung-s6d7aa0.o
+--- a/drivers/net/wireless/ath/wcn36xx/main.c
++++ b/drivers/net/wireless/ath/wcn36xx/main.c
+@@ -33,6 +33,17 @@
+ module_param_named(debug_mask, wcn36xx_dbg_mask, uint, 0644);
+ MODULE_PARM_DESC(debug_mask, "Debugging mask");
+ 
++/*
++ * Some WCNSS firmware (Samsung's 2017 build for the wcn3680 in the Galaxy Tab
++ * Pro 8.4: "WCN v2.0 RadioPhy vIris_TSMC_3.0", API 1.5.1.2) advertises
++ * SCAN_OFFLOAD but never answers UPDATE_CHANNEL_LIST or START_SCAN_OFFLOAD,
++ * so every scan times out. scan_offload=0 takes the legacy mac80211 software
++ * scan path that the vendor prima driver used on that firmware.
++ */
++static bool scan_offload = true;
++module_param(scan_offload, bool, 0644);
++MODULE_PARM_DESC(scan_offload, "Use firmware scan offload when advertised (default: Y)");
++
+ #define CHAN2G(_freq, _idx) { \
+ 	.band = NL80211_BAND_2GHZ, \
+ 	.center_freq = (_freq), \
+@@ -632,7 +643,8 @@
+ {
+ 	struct wcn36xx *wcn = hw->priv;
+ 
+-	if (!wcn36xx_firmware_get_feat_caps(wcn->fw_feat_caps, SCAN_OFFLOAD)) {
++	if (!scan_offload ||
++	    !wcn36xx_firmware_get_feat_caps(wcn->fw_feat_caps, SCAN_OFFLOAD)) {
+ 		/* fallback to mac80211 software scan */
+ 		return 1;
+ 	}
+@@ -670,7 +682,8 @@
+ 	wcn->scan_aborted = true;
+ 	mutex_unlock(&wcn->scan_lock);
+ 
+-	if (wcn36xx_firmware_get_feat_caps(wcn->fw_feat_caps, SCAN_OFFLOAD)) {
++	if (scan_offload &&
++	    wcn36xx_firmware_get_feat_caps(wcn->fw_feat_caps, SCAN_OFFLOAD)) {
+ 		/* ieee80211_scan_completed will be called on FW scan
+ 		 * indication */
+ 		wcn36xx_smd_stop_hw_scan(wcn);
 --- a/drivers/gpu/drm/panel/panel-samsung-r63319.c
 +++ b/drivers/gpu/drm/panel/panel-samsung-r63319.c
 @@ -0,0 +1,765 @@
@@ -2023,7 +2063,7 @@
 +MODULE_LICENSE("GPL");
 --- a/arch/arm/boot/dts/qcom/qcom-msm8974-samsung-mondrianwifi.dts
 +++ b/arch/arm/boot/dts/qcom/qcom-msm8974-samsung-mondrianwifi.dts
-@@ -0,0 +1,482 @@
+@@ -0,0 +1,508 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +/*
 + * Samsung Galaxy Tab Pro 8.4 Wi-Fi (SM-T320, "mondrianwifi")
@@ -2128,6 +2168,23 @@
 + * irq pm8941_gpios 30, avdd = l22 (3.3V live), vcc_i2c = l10 (1.85V live).
 + * Wiring is identical to qcom-msm8974-samsung-hlte.dts.
 + */
++/*
++ * Accelerometer/gyro: InvenSense MPU-6515 on BLSP2 QUP6 (vendor DT
++ * msm8974-sec-mondrian-r12.dtsi: i2c@f9968000, mpu9250@68, irq gpio 86).
++ * Drives screen rotation through iio-sensor-proxy.
++ */
++&blsp2_i2c6 {
++	status = "okay";
++
++	accelerometer@68 {
++		compatible = "invensense,mpu6515";
++		reg = <0x68>;
++		interrupts-extended = <&tlmm 86 IRQ_TYPE_EDGE_RISING>;
++		vdd-supply = <&pm8941_l18>;
++		vddio-supply = <&pm8941_lvs1>;
++	};
++};
++
 +&blsp1_i2c2 {
 +	status = "okay";
 +
@@ -2285,6 +2342,15 @@
 +		pm8941_l19: l19 {
 +			regulator-min-microvolt = <2900000>;
 +			regulator-max-microvolt = <3350000>;
++		};
++
++		/* sensors (vendor: mpu9250-vcc / -lvs1 supplies) */
++		pm8941_l18: l18 {
++			regulator-min-microvolt = <2850000>;
++			regulator-max-microvolt = <2850000>;
++		};
++
++		pm8941_lvs1: lvs1 {
 +		};
 +	};
 +};
