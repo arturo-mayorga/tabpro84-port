@@ -1111,6 +1111,51 @@
  	}
  
  	DBG("%s: assign to plane %s for caps %x",
+@@ -135,8 +153,13 @@
+ 
+ 	new_state = &state->hwpipe;
+ 
+-	if (WARN_ON(!new_state->hwpipe_to_plane[hwpipe->idx]))
+-		return -EINVAL;
++	/*
++	 * Already released: after drm_atomic_helper_suspend() disabled the
++	 * plane the resumed (duplicated) plane state still carries the old
++	 * hwpipe pointer, but the global assignment is gone.
++	 */
++	if (!new_state->hwpipe_to_plane[hwpipe->idx])
++		return 0;
+ 
+ 	DBG("%s: release from plane %s", hwpipe->name,
+ 		new_state->hwpipe_to_plane[hwpipe->idx]->name);
+@@ -151,6 +174,17 @@
+ 	return 0;
+ }
+ 
++bool mdp5_pipe_assigned(struct drm_atomic_state *s,
++			struct mdp5_hw_pipe *hwpipe, struct drm_plane *plane)
++{
++	struct mdp5_global_state *state = mdp5_get_global_state(s);
++
++	if (IS_ERR(state))
++		return false;
++
++	return state->hwpipe.hwpipe_to_plane[hwpipe->idx] == plane;
++}
++
+ struct mdp5_hw_pipe *mdp5_pipe_init(struct drm_device *dev,
+ 		enum mdp5_pipe pipe,
+ 		uint32_t reg_offset, uint32_t caps)
+--- a/drivers/gpu/drm/msm/disp/mdp5/mdp5_pipe.h
++++ b/drivers/gpu/drm/msm/disp/mdp5/mdp5_pipe.h
+@@ -38,6 +38,8 @@
+ 		     struct mdp5_hw_pipe **hwpipe,
+ 		     struct mdp5_hw_pipe **r_hwpipe);
+ int mdp5_pipe_release(struct drm_atomic_state *s, struct mdp5_hw_pipe *hwpipe);
++bool mdp5_pipe_assigned(struct drm_atomic_state *s,
++			struct mdp5_hw_pipe *hwpipe, struct drm_plane *plane);
+ 
+ struct mdp5_hw_pipe *mdp5_pipe_init(struct drm_device *dev,
+ 		enum mdp5_pipe pipe,
 --- a/drivers/gpu/drm/msm/disp/mdp5/mdp5_plane.c
 +++ b/drivers/gpu/drm/msm/disp/mdp5/mdp5_plane.c
 @@ -69,7 +69,7 @@
@@ -1142,7 +1187,24 @@
  	if (plane_enabled(state)) {
  		unsigned int rotation;
  		const struct msm_format *format;
-@@ -853,6 +866,10 @@
+@@ -249,6 +262,16 @@
+ 			new_hwpipe = true;
+ 
+ 		/*
++		 * The plane state duplicated by drm_atomic_helper_suspend()
++		 * keeps its hwpipe pointer across the disable that released the
++		 * global assignment (and its SMP blocks); on resume the pipe
++		 * must be assigned again or the next suspend fails to release it.
++		 */
++		if (mdp5_state->hwpipe &&
++		    !mdp5_pipe_assigned(state->state, mdp5_state->hwpipe, plane))
++			new_hwpipe = true;
++
++		/*
+ 		 * (re)allocte hw pipe if we're either requesting for 2 hw pipes
+ 		 * or we're switching from 2 hw pipes to 1 hw pipe because the
+ 		 * new src_w can be supported by 1 hw pipe itself.
+@@ -853,6 +876,10 @@
  	enum mdp5_pipe pipe = hwpipe->pipe;
  	struct mdp5_hw_pipe *right_hwpipe;
  	const struct msm_format *format;
@@ -1153,7 +1215,7 @@
  	uint32_t nplanes, config = 0;
  	struct phase_step step = { { 0 } };
  	struct pixel_ext pe = { { 0 } };
-@@ -900,7 +917,23 @@
+@@ -900,7 +927,23 @@
  			crtc->base.id, crtc_x, crtc_y, crtc_w, crtc_h);
  
  	right_hwpipe = to_mdp5_plane_state(pstate)->r_hwpipe;
@@ -1178,7 +1240,7 @@
  		/*
  		 * if the plane comprises of 2 hw pipes, assume that the width
  		 * is split equally across them. The only parameters that varies
-@@ -909,6 +942,13 @@
+@@ -909,6 +952,13 @@
  		crtc_w /= 2;
  		src_w /= 2;
  		src_img_w /= 2;
@@ -1192,7 +1254,7 @@
  	}
  
  	ret = calc_scalex_steps(plane, pix_format, src_w, crtc_w, step.x);
-@@ -948,9 +988,9 @@
+@@ -948,9 +998,9 @@
  	if (right_hwpipe)
  		mdp5_hwpipe_mode_set(mdp5_kms, right_hwpipe, fb, &step, &pe,
  				     config, hdecm, vdecm, hflip, vflip,
@@ -1204,7 +1266,7 @@
  
  	return ret;
  }
-@@ -995,6 +1035,31 @@
+@@ -995,6 +1045,31 @@
  	return mask;
  }
  
@@ -2132,7 +2194,7 @@
 +MODULE_LICENSE("GPL");
 --- a/arch/arm/boot/dts/qcom/qcom-msm8974-samsung-mondrianwifi.dts
 +++ b/arch/arm/boot/dts/qcom/qcom-msm8974-samsung-mondrianwifi.dts
-@@ -0,0 +1,841 @@
+@@ -0,0 +1,840 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +/*
 + * Samsung Galaxy Tab Pro 8.4 Wi-Fi (SM-T320, "mondrianwifi")
@@ -2202,6 +2264,44 @@
 +
 +			enable-supply = <&backlight_en>;
 +		};
++	};
++
++	/*
++	 * Battery. Samsung did not use the PMIC's charger: downstream has a
++	 * MAX77888 charger/MUIC on a bit-banged bus (gpio83/84, addr 0x66) and a
++	 * "sec-fuelgauge" at 0x36 on another (gpio51/52). Mainline has no
++	 * MAX77888 driver, so charging runs at the chip's hardware default (the
++	 * laptop USB port could not keep up with a loaded SoC: UVLO power-offs).
++	 * The gauge is a MAX17048 or MAX17050 (same address) - confirm with the
++	 * version register and fix the compatible if needed.
++	 */
++	i2c-fuelgauge {
++		compatible = "i2c-gpio";
++		sda-gpios = <&tlmm 51 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		scl-gpios = <&tlmm 52 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		i2c-gpio,delay-us = <4>;
++
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		/* MAX17050: the max17040 driver bound at this address but read 0 %
++		 * and 2.57 V on a running tablet, i.e. the wrong register map. */
++		fuelgauge: battery@36 {
++			compatible = "maxim,max17050";
++			reg = <0x36>;
++			maxim,rsns-microohm = <10000>;
++		};
++	};
++
++	i2c-charger {
++		compatible = "i2c-gpio";
++		sda-gpios = <&tlmm 83 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		scl-gpios = <&tlmm 84 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		i2c-gpio,delay-us = <4>;
++
++		#address-cells = <1>;
++		#size-cells = <0>;
++		/* MAX77888 at 0x66: no mainline driver yet; bus exists for i2cdump */
 +	};
 +
 +	gpio-keys {
@@ -2360,6 +2460,15 @@
 +		clocks = <&hfpll0>, <&hfpll1>, <&hfpll2>, <&hfpll3>, <&hfpll_l2>;
 +		clock-names = "hfpll0", "hfpll1", "hfpll2", "hfpll3", "hfpll_l2";
 +		#clock-cells = <1>;
++		/*
++		 * L2 clock. Nothing upstream scales it with the cores; the
++		 * bootloader leaves it at 729.6 MHz, and Krait needs L2 >= core/2:
++		 * cores at 1958 MHz over a 729.6 MHz L2 die the instant real
++		 * (cache-heavy) code runs, while a register-only loop survives.
++		 * Vendor l2-fmax: 576 (SVS), 1036.8 (NORMAL), 1728 (SUPER_TURBO).
++		 */
++		assigned-clocks = <&kraitcc 4>;
++		assigned-clock-rates = <1036800000>;
 +	};
 +};
 +
@@ -2461,54 +2570,6 @@
 +		opp-1344000000 {
 +			opp-hz = /bits/ 64 <1344000000>;
 +			opp-microvolt = <980000 980000 1100000>;
-+			clock-latency-ns = <100000>;
-+		};
-+
-+		opp-1420800000 {
-+			opp-hz = /bits/ 64 <1420800000>;
-+			opp-microvolt = <995000 995000 1100000>;
-+			clock-latency-ns = <100000>;
-+		};
-+
-+		opp-1497600000 {
-+			opp-hz = /bits/ 64 <1497600000>;
-+			opp-microvolt = <1010000 1010000 1100000>;
-+			clock-latency-ns = <100000>;
-+		};
-+
-+		opp-1574400000 {
-+			opp-hz = /bits/ 64 <1574400000>;
-+			opp-microvolt = <1025000 1025000 1100000>;
-+			clock-latency-ns = <100000>;
-+		};
-+
-+		opp-1651200000 {
-+			opp-hz = /bits/ 64 <1651200000>;
-+			opp-microvolt = <1040000 1040000 1100000>;
-+			clock-latency-ns = <100000>;
-+		};
-+
-+		opp-1728000000 {
-+			opp-hz = /bits/ 64 <1728000000>;
-+			opp-microvolt = <1055000 1055000 1100000>;
-+			clock-latency-ns = <100000>;
-+		};
-+
-+		opp-1804800000 {
-+			opp-hz = /bits/ 64 <1804800000>;
-+			opp-microvolt = <1070000 1070000 1100000>;
-+			clock-latency-ns = <100000>;
-+		};
-+
-+		opp-1881600000 {
-+			opp-hz = /bits/ 64 <1881600000>;
-+			opp-microvolt = <1085000 1085000 1100000>;
-+			clock-latency-ns = <100000>;
-+		};
-+
-+		opp-1958400000 {
-+			opp-hz = /bits/ 64 <1958400000>;
-+			opp-microvolt = <1100000 1100000 1100000>;
 +			clock-latency-ns = <100000>;
 +		};
 +	};
